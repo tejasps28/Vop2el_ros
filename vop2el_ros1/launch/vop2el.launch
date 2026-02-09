@@ -1,0 +1,7 @@
+<launch>
+  <arg name="config" default="$(find vop2el_ros1)/config/vop2el.yaml"/>
+
+  <node pkg="vop2el_ros1" type="vop2el_node" name="vop2el" output="screen">
+    <rosparam command="load" file="$(arg config)"/>
+  </node>
+</launch>
