@@ -19,6 +19,8 @@
  */
 
 #include <thread>
+#include <atomic>
+#include <algorithm>
 
 #include "Vop2elAlgorithm.h"
 #include "Common.h"
@@ -26,6 +28,46 @@
 
 namespace Vop2el
 {
+namespace
+{
+struct RelativePoseCost
+{
+    RelativePoseCost(const Eigen::Quaterniond& q_meas, const Eigen::Vector3d& t_meas)
+        : q_meas_(q_meas), t_meas_(t_meas) {}
+
+    template <typename T>
+    bool operator()(const T* const qi, const T* const ti,
+                    const T* const qj, const T* const tj,
+                    T* residual) const
+    {
+        Eigen::Quaternion<T> Q_i(qi[0], qi[1], qi[2], qi[3]);
+        Eigen::Quaternion<T> Q_j(qj[0], qj[1], qj[2], qj[3]);
+        Eigen::Matrix<T, 3, 1> t_i(ti[0], ti[1], ti[2]);
+        Eigen::Matrix<T, 3, 1> t_j(tj[0], tj[1], tj[2]);
+
+        Eigen::Quaternion<T> q_rel = Q_i.conjugate() * Q_j;
+        Eigen::Matrix<T, 3, 1> t_rel = Q_i.conjugate() * (t_j - t_i);
+
+        Eigen::Quaternion<T> q_meas = q_meas_.cast<T>();
+        Eigen::Matrix<T, 3, 1> t_meas = t_meas_.cast<T>();
+
+        Eigen::Quaternion<T> q_err = q_meas.conjugate() * q_rel;
+        if (q_err.w() < T(0))
+            q_err.coeffs() = -q_err.coeffs();
+
+        residual[0] = t_rel(0) - t_meas(0);
+        residual[1] = t_rel(1) - t_meas(1);
+        residual[2] = t_rel(2) - t_meas(2);
+        residual[3] = T(2.0) * q_err.x();
+        residual[4] = T(2.0) * q_err.y();
+        residual[5] = T(2.0) * q_err.z();
+        return true;
+    }
+
+    Eigen::Quaterniond q_meas_;
+    Eigen::Vector3d t_meas_;
+};
+}
 //-------------------------------------------------------------------------------------------
 void Vop2elAlgorithm::EstimateInitMatchesUsingOF(std::shared_ptr<const cv::Mat> refImage,
                                                 std::shared_ptr<const cv::Mat> tarImage,
@@ -239,25 +281,29 @@ void Vop2elAlgorithm::ComputeScalessRelativeTransform(const std::vector<Vop2el::
     cv::Mat maskInliers;
     cv::Mat essentielMatrix;
     essentielMatrix = cv::findEssentialMat(actPoints, prevPoints, this->Vop2elParams.CameraParams.CalibrationMatrix,
-                                        cv::RANSAC, 0.999, 1, 1000, maskInliers);
+                                        cv::RANSAC, 0.999, 1, maskInliers);
+
+    if (maskInliers.empty())
+        throw std::runtime_error("[ERROR] findEssentialMat returned an empty inlier mask.");
+
+    cv::Mat maskContinuous = maskInliers.isContinuous() ? maskInliers : maskInliers.clone();
+    cv::Mat inliersMask = maskContinuous.reshape(1, static_cast<int>(maskContinuous.total())).clone();
 
     std::vector<bool> keyPointsInliersStatus(matches.size(), false);
-    for (int keyPointIdx = 0; keyPointIdx < maskInliers.rows; ++keyPointIdx)
+    int inlierCount = std::min(static_cast<int>(matches.size()), inliersMask.rows);
+    for (int keyPointIdx = 0; keyPointIdx < inlierCount; ++keyPointIdx)
     {
-        for (int keyPointItrIdx = 0; keyPointItrIdx <  maskInliers.cols; ++keyPointItrIdx)
-            if (maskInliers.at<unsigned char>(keyPointIdx, keyPointItrIdx) == 1)
-            {
-                keyPointsInliersStatus[keyPointIdx] = true;
-                inliers.push_back(matches[keyPointIdx]);
-                break;
-            }
+        if (inliersMask.at<unsigned char>(keyPointIdx, 0) != 0)
+        {
+            keyPointsInliersStatus[keyPointIdx] = true;
+            inliers.push_back(matches[keyPointIdx]);
+        }
     }
 
     cv::Mat optimizedEssentielMatrix;
     this->OptimizeEssentielMatrix(essentielMatrix, prevPoints, actPoints, keyPointsInliersStatus, optimizedEssentielMatrix);
 
     cv::Mat finalRotation, finalTranslation;
-    cv::Mat inliersMask = (maskInliers.col(maskInliers.cols - 1)).clone();
     cv::recoverPose(optimizedEssentielMatrix, actPoints, prevPoints, this->Vop2elParams.CameraParams.CalibrationMatrix,
                     finalRotation, finalTranslation, inliersMask);
 
@@ -353,12 +399,25 @@ void Vop2elAlgorithm::EstimateInitScaledRelativeTransform(Eigen::Affine3d& initi
 }
 
 //-------------------------------------------------------------------------------------------
-void Vop2elAlgorithm::ProcessNumMatchesInsufficient()
+bool Vop2elAlgorithm::ProcessNumMatchesInsufficient()
 {
-    std::cerr << "[WARNING] The number of computed matches is insufficient. We will extrapolate." << std::endl;
-    this->RelativePoses.push_back(this->RelativePoses.back());
-    Eigen::Affine3d absolutePose = this->AbsolutePoses.back() * this->RelativePoses.back();
+    std::cerr << "[WARNING] The number of computed matches is insufficient. "
+              << (this->Vop2elParams.ExtrapolateOnFailure ? "Applying last-motion extrapolation." : "Holding pose (identity fallback).")
+              << std::endl;
+    std::lock_guard<std::mutex> lock(this->PosesMutex);
+    Eigen::Affine3d fallbackRelative = Eigen::Affine3d::Identity();
+    bool usedExtrapolation = false;
+    if (this->Vop2elParams.ExtrapolateOnFailure && !this->RelativePoses.empty())
+    {
+        fallbackRelative = this->RelativePoses.back();
+        usedExtrapolation = true;
+    }
+
+    this->RelativePoses.push_back(fallbackRelative);
+    Eigen::Affine3d absolutePose = this->AbsolutePoses.back() * fallbackRelative;
     this->AbsolutePoses.push_back(absolutePose);
+    this->PushPoseToWindow(absolutePose, &fallbackRelative);
+    return usedExtrapolation;
 }
 
 //-------------------------------------------------------------------------------------------
@@ -373,7 +432,13 @@ void Vop2elAlgorithm::ProcessStereoFrame(const std::string& leftImage,
 
     if (this->FrameIndex == 0)
     {
-       this->AbsolutePoses.push_back(Eigen::Affine3d::Identity());
+       this->SetLastFrameDebugStats(0, 0, false, false, 0);
+       {
+           std::lock_guard<std::mutex> lock(this->PosesMutex);
+           Eigen::Affine3d origin = Eigen::Affine3d::Identity();
+           this->AbsolutePoses.push_back(origin);
+           this->PushPoseToWindow(origin, nullptr);
+       }
        ++this->FrameIndex;
     }
     else
@@ -384,46 +449,417 @@ void Vop2elAlgorithm::ProcessStereoFrame(const std::string& leftImage,
                                                 this->FramesHandler.GetLeftImageKeyPoints(-1)};
 
         Eigen::Affine3d initialRelativeTransform;
-        this->EstimateInitScaledRelativeTransform(initialRelativeTransform);
-
         std::vector<Vop2el::Match> matches;
         int NumberFixedKeyPoints = 0;
-        this->ComputeMatchesUsingVop2elMatcher(StereoImagesPairWithKeyPoints, initialRelativeTransform, matches, NumberFixedKeyPoints);
+        try
+        {
+            this->EstimateInitScaledRelativeTransform(initialRelativeTransform);
+            this->ComputeMatchesUsingVop2elMatcher(StereoImagesPairWithKeyPoints, initialRelativeTransform, matches, NumberFixedKeyPoints);
+        }
+        catch (const cv::Exception& ex)
+        {
+            std::cerr << "[ERROR] OpenCV exception during initialization/matching: " << ex.what() << std::endl;
+            const bool usedExtrapolation = this->ProcessNumMatchesInsufficient();
+            this->SetLastFrameDebugStats(static_cast<int>(matches.size()), 0, true, usedExtrapolation, 4);
+            this->MaybeOptimizeSlidingWindow();
+            return;
+        }
 
         std::cout << "Number of matches: " <<  matches.size() << std::endl;
 
         if (matches.size() < 10)
         {
-            this->ProcessNumMatchesInsufficient();
+            const bool usedExtrapolation = this->ProcessNumMatchesInsufficient();
+            this->SetLastFrameDebugStats(static_cast<int>(matches.size()), 0, true, usedExtrapolation, 1);
+            this->MaybeOptimizeSlidingWindow();
             return;
         }
 
         double ratioOfFixedKeyPoints = static_cast<double>(NumberFixedKeyPoints) / static_cast<double>(matches.size());
         if (ratioOfFixedKeyPoints > 0.6)
         {
-            this->RelativePoses.push_back(Eigen::Affine3d::Identity());
-            this->AbsolutePoses.push_back(this->AbsolutePoses.back());
+            {
+                std::lock_guard<std::mutex> lock(this->PosesMutex);
+                this->RelativePoses.push_back(Eigen::Affine3d::Identity());
+                this->AbsolutePoses.push_back(this->AbsolutePoses.back());
+            }
+            this->SetLastFrameDebugStats(static_cast<int>(matches.size()), 0, true, false, 3);
             relativeTransform = Eigen::Affine3d::Identity();
             ++this->FrameIndex;
+            this->MaybeOptimizeSlidingWindow();
             return;
         }
 
         Eigen::Affine3d scalessTransform = Eigen::Affine3d::Identity();
         std::vector<Vop2el::Match> inliers;
-        this->ComputeScalessRelativeTransform(matches, scalessTransform, inliers);
-
-        double scale = this->ComputeScale(scalessTransform, inliers);
+        double scale = 1.0;
+        try
+        {
+            this->ComputeScalessRelativeTransform(matches, scalessTransform, inliers);
+            if (inliers.size() < 10)
+            {
+                const bool usedExtrapolation = this->ProcessNumMatchesInsufficient();
+                this->SetLastFrameDebugStats(static_cast<int>(matches.size()), static_cast<int>(inliers.size()),
+                                             true, usedExtrapolation, 2);
+                this->MaybeOptimizeSlidingWindow();
+                return;
+            }
+            scale = this->ComputeScale(scalessTransform, inliers);
+        }
+        catch (const cv::Exception& ex)
+        {
+            std::cerr << "[ERROR] OpenCV exception during motion refinement: " << ex.what() << std::endl;
+            const bool usedExtrapolation = this->ProcessNumMatchesInsufficient();
+            this->SetLastFrameDebugStats(static_cast<int>(matches.size()), static_cast<int>(inliers.size()),
+                                         true, usedExtrapolation, 5);
+            this->MaybeOptimizeSlidingWindow();
+            return;
+        }
 
         Eigen::Affine3d scaledTransform = scalessTransform;
         scaledTransform.translation() = scale * scalessTransform.translation();
-        this->RelativePoses.push_back(scaledTransform);
+        {
+            std::lock_guard<std::mutex> lock(this->PosesMutex);
+            this->RelativePoses.push_back(scaledTransform);
+        }
         relativeTransform = scaledTransform;
 
         Eigen::Affine3d absolutePose = Eigen::Affine3d::Identity();
-        absolutePose = this->AbsolutePoses.back() * scaledTransform;
-        this->AbsolutePoses.push_back(absolutePose);
+        {
+            std::lock_guard<std::mutex> lock(this->PosesMutex);
+            absolutePose = this->AbsolutePoses.back() * scaledTransform;
+            this->AbsolutePoses.push_back(absolutePose);
+            this->PushPoseToWindow(absolutePose, &scaledTransform);
+        }
+        this->SetLastFrameDebugStats(static_cast<int>(matches.size()), static_cast<int>(inliers.size()),
+                                     false, false, 0);
 
         ++this->FrameIndex;
+        this->MaybeOptimizeSlidingWindow();
     }
+}
+
+//-------------------------------------------------------------------------------------------
+void Vop2elAlgorithm::ProcessStereoFrame(const cv::Mat& leftImage,
+                                        const cv::Mat& rightImage,
+                                        Eigen::Affine3d& relativeTransform)
+{
+    if (this->FrameIndex < 2)
+        this->FramesHandler.AddStereoPair(leftImage, rightImage);
+    else
+        this->FramesHandler.AddStereoPair(leftImage, rightImage, true, false);
+
+    if (this->FrameIndex == 0)
+    {
+       this->SetLastFrameDebugStats(0, 0, false, false, 0);
+       {
+           std::lock_guard<std::mutex> lock(this->PosesMutex);
+           Eigen::Affine3d origin = Eigen::Affine3d::Identity();
+           this->AbsolutePoses.push_back(origin);
+           this->PushPoseToWindow(origin, nullptr);
+       }
+       ++this->FrameIndex;
+    }
+    else
+    {
+        Vop2el::StereoImagesPairWithKeyPoints StereoImagesPairWithKeyPoints{
+                                                this->FramesHandler.GetLeftImage(-2), this->FramesHandler.GetRightImage(-2),
+                                                this->FramesHandler.GetLeftImage(-1), this->FramesHandler.GetRightImage(-1),
+                                                this->FramesHandler.GetLeftImageKeyPoints(-1)};
+
+        Eigen::Affine3d initialRelativeTransform;
+        std::vector<Vop2el::Match> matches;
+        int NumberFixedKeyPoints = 0;
+        try
+        {
+            this->EstimateInitScaledRelativeTransform(initialRelativeTransform);
+            this->ComputeMatchesUsingVop2elMatcher(StereoImagesPairWithKeyPoints, initialRelativeTransform, matches, NumberFixedKeyPoints);
+        }
+        catch (const cv::Exception& ex)
+        {
+            std::cerr << "[ERROR] OpenCV exception during initialization/matching: " << ex.what() << std::endl;
+            const bool usedExtrapolation = this->ProcessNumMatchesInsufficient();
+            this->SetLastFrameDebugStats(static_cast<int>(matches.size()), 0, true, usedExtrapolation, 4);
+            this->MaybeOptimizeSlidingWindow();
+            return;
+        }
+
+        std::cout << "Number of matches: " <<  matches.size() << std::endl;
+
+        if (matches.size() < 10)
+        {
+            const bool usedExtrapolation = this->ProcessNumMatchesInsufficient();
+            this->SetLastFrameDebugStats(static_cast<int>(matches.size()), 0, true, usedExtrapolation, 1);
+            this->MaybeOptimizeSlidingWindow();
+            return;
+        }
+
+        double ratioOfFixedKeyPoints = static_cast<double>(NumberFixedKeyPoints) / static_cast<double>(matches.size());
+        if (ratioOfFixedKeyPoints > 0.6)
+        {
+            {
+                std::lock_guard<std::mutex> lock(this->PosesMutex);
+                this->RelativePoses.push_back(Eigen::Affine3d::Identity());
+                this->AbsolutePoses.push_back(this->AbsolutePoses.back());
+            }
+            this->SetLastFrameDebugStats(static_cast<int>(matches.size()), 0, true, false, 3);
+            relativeTransform = Eigen::Affine3d::Identity();
+            ++this->FrameIndex;
+            this->MaybeOptimizeSlidingWindow();
+            return;
+        }
+
+        Eigen::Affine3d scalessTransform = Eigen::Affine3d::Identity();
+        std::vector<Vop2el::Match> inliers;
+        double scale = 1.0;
+        try
+        {
+            this->ComputeScalessRelativeTransform(matches, scalessTransform, inliers);
+            if (inliers.size() < 10)
+            {
+                const bool usedExtrapolation = this->ProcessNumMatchesInsufficient();
+                this->SetLastFrameDebugStats(static_cast<int>(matches.size()), static_cast<int>(inliers.size()),
+                                             true, usedExtrapolation, 2);
+                this->MaybeOptimizeSlidingWindow();
+                return;
+            }
+            scale = this->ComputeScale(scalessTransform, inliers);
+        }
+        catch (const cv::Exception& ex)
+        {
+            std::cerr << "[ERROR] OpenCV exception during motion refinement: " << ex.what() << std::endl;
+            const bool usedExtrapolation = this->ProcessNumMatchesInsufficient();
+            this->SetLastFrameDebugStats(static_cast<int>(matches.size()), static_cast<int>(inliers.size()),
+                                         true, usedExtrapolation, 5);
+            this->MaybeOptimizeSlidingWindow();
+            return;
+        }
+
+        Eigen::Affine3d scaledTransform = scalessTransform;
+        scaledTransform.translation() = scale * scalessTransform.translation();
+        {
+            std::lock_guard<std::mutex> lock(this->PosesMutex);
+            this->RelativePoses.push_back(scaledTransform);
+        }
+        relativeTransform = scaledTransform;
+
+        Eigen::Affine3d absolutePose = Eigen::Affine3d::Identity();
+        {
+            std::lock_guard<std::mutex> lock(this->PosesMutex);
+            absolutePose = this->AbsolutePoses.back() * scaledTransform;
+            this->AbsolutePoses.push_back(absolutePose);
+            this->PushPoseToWindow(absolutePose, &scaledTransform);
+        }
+        this->SetLastFrameDebugStats(static_cast<int>(matches.size()), static_cast<int>(inliers.size()),
+                                     false, false, 0);
+
+        ++this->FrameIndex;
+        this->MaybeOptimizeSlidingWindow();
+    }
+}
+
+//-------------------------------------------------------------------------------------------
+Vop2elAlgorithm::~Vop2elAlgorithm()
+{
+    if (this->OptimizerThread.joinable())
+        this->OptimizerThread.join();
+}
+
+//-------------------------------------------------------------------------------------------
+std::vector<Eigen::Affine3d> Vop2elAlgorithm::GetPosesCopy() const
+{
+    std::lock_guard<std::mutex> lock(this->PosesMutex);
+    return this->AbsolutePoses;
+}
+
+//-------------------------------------------------------------------------------------------
+std::vector<cv::Point2f> Vop2elAlgorithm::GetLatestLeftKeyPointsCopy() const
+{
+    if (this->FramesHandler.GetSize() == 0)
+        return {};
+
+    try
+    {
+        std::shared_ptr<const std::vector<cv::Point2f>> keypoints = this->FramesHandler.GetLeftImageKeyPoints(-1);
+        if (!keypoints)
+            return {};
+        return *keypoints;
+    }
+    catch (const std::exception&)
+    {
+        return {};
+    }
+}
+
+//-------------------------------------------------------------------------------------------
+Vop2elAlgorithm::FrameDebugStats Vop2elAlgorithm::GetLastFrameDebugStats() const
+{
+    std::lock_guard<std::mutex> lock(this->StatsMutex);
+    return this->LastFrameDebugStats;
+}
+
+//-------------------------------------------------------------------------------------------
+Eigen::Affine3d Vop2elAlgorithm::GetCurrentAbsPose() const
+{
+    std::lock_guard<std::mutex> lock(this->PosesMutex);
+    return this->AbsolutePoses.back();
+}
+
+//-------------------------------------------------------------------------------------------
+void Vop2elAlgorithm::SetLastFrameDebugStats(int matchCount, int inlierCount, bool usedFallback, bool usedExtrapolation, int failureReason)
+{
+    std::lock_guard<std::mutex> lock(this->StatsMutex);
+    this->LastFrameDebugStats.MatchCount = matchCount;
+    this->LastFrameDebugStats.InlierCount = inlierCount;
+    this->LastFrameDebugStats.UsedFallback = usedFallback;
+    this->LastFrameDebugStats.UsedExtrapolation = usedExtrapolation;
+    this->LastFrameDebugStats.FailureReason = failureReason;
+}
+
+//-------------------------------------------------------------------------------------------
+void Vop2elAlgorithm::PushPoseToWindow(const Eigen::Affine3d& absolutePose, const Eigen::Affine3d* relativePose)
+{
+    this->WindowPoses.push_back(absolutePose);
+    if (relativePose != nullptr)
+        this->WindowRelPoses.push_back(*relativePose);
+
+    int maxWindow = std::max(2, this->Vop2elParams.SlidingWindowSize);
+    while (static_cast<int>(this->WindowPoses.size()) > maxWindow)
+    {
+        this->WindowPoses.pop_front();
+        if (!this->WindowRelPoses.empty())
+            this->WindowRelPoses.pop_front();
+        ++this->WindowStartIndex;
+    }
+}
+
+//-------------------------------------------------------------------------------------------
+void Vop2elAlgorithm::MaybeOptimizeSlidingWindow()
+{
+    if (!this->Vop2elParams.EnableSlidingWindow)
+        return;
+
+    if (this->Vop2elParams.SlidingWindowSize < 2)
+        return;
+
+    int totalPoses = 0;
+    int totalRel = 0;
+    {
+        std::lock_guard<std::mutex> lock(this->PosesMutex);
+        totalPoses = static_cast<int>(this->WindowPoses.size());
+        totalRel = static_cast<int>(this->WindowRelPoses.size());
+    }
+
+    if (totalPoses < 2 || totalRel < 1)
+        return;
+
+    int windowSize = std::min(this->Vop2elParams.SlidingWindowSize, totalPoses);
+    int startIndex = 0;
+
+    std::vector<Eigen::Affine3d> windowPoses;
+    std::vector<Eigen::Affine3d> windowRel;
+    {
+        std::lock_guard<std::mutex> lock(this->PosesMutex);
+        startIndex = this->WindowStartIndex;
+        windowPoses.assign(this->WindowPoses.begin(), this->WindowPoses.end());
+        windowRel.assign(this->WindowRelPoses.begin(), this->WindowRelPoses.end());
+    }
+
+    if (windowRel.size() < 1)
+        return;
+
+    if (!this->Vop2elParams.SlidingWindowBackground)
+    {
+        this->OptimizeSlidingWindowThread(startIndex, windowSize, windowPoses, windowRel);
+        return;
+    }
+
+    if (this->OptimizationInProgress.exchange(true))
+        return;
+
+    if (this->OptimizerThread.joinable())
+        this->OptimizerThread.join();
+
+    this->OptimizerThread = std::thread(&Vop2elAlgorithm::OptimizeSlidingWindowThread,
+                                        this, startIndex, windowSize, windowPoses, windowRel);
+}
+
+//-------------------------------------------------------------------------------------------
+void Vop2elAlgorithm::OptimizeSlidingWindowThread(int startIndex, int windowSize,
+                                                const std::vector<Eigen::Affine3d>& windowPoses,
+                                                const std::vector<Eigen::Affine3d>& windowRelPoses)
+{
+    struct PoseParam
+    {
+        double q[4];
+        double t[3];
+    };
+
+    std::vector<PoseParam> params(windowSize);
+    for (int i = 0; i < windowSize; ++i)
+    {
+        Eigen::Quaterniond q(windowPoses[i].rotation());
+        params[i].q[0] = q.w();
+        params[i].q[1] = q.x();
+        params[i].q[2] = q.y();
+        params[i].q[3] = q.z();
+        params[i].t[0] = windowPoses[i].translation().x();
+        params[i].t[1] = windowPoses[i].translation().y();
+        params[i].t[2] = windowPoses[i].translation().z();
+    }
+
+    ceres::Problem problem;
+    for (int i = 0; i < windowSize - 1; ++i)
+    {
+        Eigen::Quaterniond q_meas(windowRelPoses[i].rotation());
+        Eigen::Vector3d t_meas = windowRelPoses[i].translation();
+
+        ceres::CostFunction* cost = new ceres::AutoDiffCostFunction<RelativePoseCost, 6, 4, 3, 4, 3>(
+            new RelativePoseCost(q_meas, t_meas));
+        ceres::LossFunction* loss = new ceres::HuberLoss(1.0);
+        problem.AddResidualBlock(cost, loss, params[i].q, params[i].t, params[i + 1].q, params[i + 1].t);
+    }
+
+    ceres::LocalParameterization* quat_param = new ceres::EigenQuaternionParameterization();
+    for (int i = 0; i < windowSize; ++i)
+        problem.SetParameterization(params[i].q, quat_param);
+
+    // Fix first pose in window to anchor.
+    problem.SetParameterBlockConstant(params[0].q);
+    problem.SetParameterBlockConstant(params[0].t);
+
+    ceres::Solver::Options options;
+    options.linear_solver_type = ceres::DENSE_QR;
+    options.max_num_iterations = 30;
+    options.num_threads = std::thread::hardware_concurrency();
+
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+
+    std::vector<Eigen::Affine3d> optimized(windowSize);
+    for (int i = 0; i < windowSize; ++i)
+    {
+        Eigen::Quaterniond q(params[i].q[0], params[i].q[1], params[i].q[2], params[i].q[3]);
+        Eigen::Affine3d pose = Eigen::Affine3d::Identity();
+        pose.linear() = q.normalized().toRotationMatrix();
+        pose.translation() = Eigen::Vector3d(params[i].t[0], params[i].t[1], params[i].t[2]);
+        optimized[i] = pose;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(this->PosesMutex);
+        if (static_cast<int>(this->AbsolutePoses.size()) >= startIndex + windowSize)
+        {
+            for (int i = 0; i < windowSize; ++i)
+                this->AbsolutePoses[startIndex + i] = optimized[i];
+        }
+        if (this->WindowStartIndex == startIndex && static_cast<int>(this->WindowPoses.size()) == windowSize)
+        {
+            for (int i = 0; i < windowSize; ++i)
+                this->WindowPoses[i] = optimized[i];
+        }
+    }
+
+    this->OptimizationInProgress.store(false);
 }
 }

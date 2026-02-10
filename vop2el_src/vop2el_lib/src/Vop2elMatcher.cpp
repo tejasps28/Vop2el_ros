@@ -19,9 +19,54 @@
  */
 
 #include "Vop2elMatcher.h"
+#include <atomic>
+#include <limits>
 
 namespace Vop2el
 {
+namespace
+{
+cv::Mat EnsureContinuous(const cv::Mat& input, const char* label)
+{
+    if (input.empty())
+        return input;
+    if (!input.isContinuous())
+    {
+        (void)label;
+        return input.clone();
+    }
+    return input;
+}
+
+std::pair<cv::Point2f, float> InvalidPreviousMatch()
+{
+    return std::make_pair<cv::Point2f, float>(cv::Point2f(-1.f, -1.f), std::numeric_limits<float>::lowest());
+}
+
+void LogTemplateMatchFailure(const char* where,
+                             const cv::Exception& ex,
+                             const cv::Mat& first,
+                             const char* first_label,
+                             const cv::Mat& second,
+                             const char* second_label)
+{
+    static std::atomic<int> error_count{0};
+    constexpr int kMaxLogs = 8;
+    int current = error_count.fetch_add(1, std::memory_order_relaxed);
+    if (current >= kMaxLogs)
+        return;
+
+    std::cerr << "[ERROR] matchTemplate failed in " << where << ": " << ex.what() << std::endl;
+    std::cerr << "  " << first_label << " continuous=" << first.isContinuous()
+              << " size=" << first.cols << "x" << first.rows
+              << " type=" << first.type() << " step=" << first.step << std::endl;
+    std::cerr << "  " << second_label << " continuous=" << second.isContinuous()
+              << " size=" << second.cols << "x" << second.rows
+              << " type=" << second.type() << " step=" << second.step << std::endl;
+    if (current == kMaxLogs - 1)
+        std::cerr << "[ERROR] Suppressing further matchTemplate logs." << std::endl;
+}
+}
 struct Vop2elMatcher::PatchWithScore
 {
     cv::Point2f KeyPoint;
@@ -179,19 +224,24 @@ void Vop2elMatcher::ComputeCandidatesEpipLineDiagonal(const cv::Mat& targetImage
 
         cv::Mat candidatePatch;
         cv::getRectSubPix(targetImage, patchSize, patchCenter, candidatePatch);
+        candidatePatch = EnsureContinuous(candidatePatch, "candidatePatch");
 
         if (candidatePatches.empty())
             candidatePatches = candidatePatch;
         else
         {
+            if (!candidatePatches.isContinuous())
+                candidatePatches = candidatePatches.clone();
             cv::Mat tempPatches;
             cv::hconcat(candidatePatches, candidatePatch, tempPatches);
-            candidatePatches = tempPatches;
+            candidatePatches = EnsureContinuous(tempPatches, "candidatePatches");
         }
         PatchWithScore validMatch;
         validMatch.KeyPoint = cv::Point2f(keyPointColumnFloat, keyPointRow);
         matches.emplace_back(validMatch);
     }
+    if (!candidatePatches.empty())
+        candidatePatches = candidatePatches.clone();
 }
 
 //---------------------------------------------------------------------------------------
@@ -210,12 +260,13 @@ void Vop2elMatcher::ComputeCandidatesEpipLineHorizontal(const cv::Mat& targetIma
     cv::Point2f keyPointTargetImg(keyPoint.x, - epipolarLine[2] / epipolarLine[1]);
     cv::Mat rawCandidateRegion;
     cv::getRectSubPix(targetImage, rawRegionSize, keyPointTargetImg, rawCandidateRegion);
+    rawCandidateRegion = EnsureContinuous(rawCandidateRegion, "rawCandidateRegion");
     cv::Rect2f validRect = this->GetRecInImage(targetImage.size(), rawRegionSize, keyPointTargetImg);
 
     if (validRect.width < this->Vop2elMatcherParams.HalfPatchCols * 2 + 1 ||
         validRect.height < this->Vop2elMatcherParams.HalfPatchRows * 2 + 1)
         return;
-    candidateRegion = rawCandidateRegion(validRect);
+    candidateRegion = rawCandidateRegion(validRect).clone();
 
     int startCol = -this->Vop2elMatcherParams.EpipolarLineSearchInterval + validRect.x + this->Vop2elMatcherParams.HalfPatchCols;
     int endCol = startCol + validRect.width - 2 * this->Vop2elMatcherParams.HalfPatchCols;
@@ -235,9 +286,43 @@ void Vop2elMatcher::ComputeNccOnEpipolarLine(const cv::Mat& referencePatch,
 {
     if (!searchSubImg.empty())
     {
+        cv::Mat searchMat = EnsureContinuous(searchSubImg, "searchSubImg");
+        cv::Mat refMat = EnsureContinuous(referencePatch, "referencePatch");
+        if (searchMat.cols < refMat.cols || searchMat.rows < refMat.rows)
+        {
+            for (auto& match : matches)
+            {
+                match.Score = std::numeric_limits<float>::lowest();
+                match.Type = patchType;
+            }
+            return;
+        }
+
         cv::Size patchSize(this->Vop2elMatcherParams.HalfPatchCols * 2 + 1, this->Vop2elMatcherParams.HalfPatchRows * 2 + 1);
         cv::Mat nVCCScore;
-        cv::matchTemplate(searchSubImg, referencePatch, nVCCScore, cv::TM_CCOEFF_NORMED);
+        try
+        {
+            cv::matchTemplate(searchMat, refMat, nVCCScore, cv::TM_CCOEFF_NORMED);
+        }
+        catch (const cv::Exception& ex)
+        {
+            LogTemplateMatchFailure("ComputeNccOnEpipolarLine", ex, searchMat, "searchMat", refMat, "refMat");
+            for (auto& match : matches)
+            {
+                match.Score = std::numeric_limits<float>::lowest();
+                match.Type = patchType;
+            }
+            return;
+        }
+        if (nVCCScore.empty())
+        {
+            for (auto& match : matches)
+            {
+                match.Score = std::numeric_limits<float>::lowest();
+                match.Type = patchType;
+            }
+            return;
+        }
         for (int matchIdx = 0; matchIdx < matches.size(); ++matchIdx)
         {
             if (this->IsExtrinsicRotIdentity)
@@ -328,7 +413,7 @@ void Vop2elMatcher::SearchMatchesPreviousFrame(const cv::Mat& referencePatch,
 {
     if (!(this->IsKeyPointInImage(pixTargetImage)))
     {
-        optimalMatch = std::pair<cv::Point2f, float>(cv::Point2f(-1.f, -1.f), std::numeric_limits<float>::lowest());
+        optimalMatch = InvalidPreviousMatch();
         return;
     }
 
@@ -341,12 +426,33 @@ void Vop2elMatcher::SearchMatchesPreviousFrame(const cv::Mat& referencePatch,
     if (validRect.width < (this->Vop2elMatcherParams.HalfPatchCols * 2 + 1) ||
         validRect.height < (this->Vop2elMatcherParams.HalfPatchRows * 2 + 1))
     {
-        optimalMatch = std::pair<cv::Point2f, float>(cv::Point2f(-1.f, -1.f), std::numeric_limits<float>::lowest());
+        optimalMatch = InvalidPreviousMatch();
         return;
     }
 
     cv::Mat nVCCScores;
-    cv::matchTemplate(rawCandidateRegion(validRect), referencePatch, nVCCScores, cv::TM_CCOEFF_NORMED);
+    cv::Mat refMat = EnsureContinuous(referencePatch, "referencePatchPrev");
+    cv::Mat candidateRegion = EnsureContinuous(rawCandidateRegion(validRect), "candidateRegionPrev");
+    if (candidateRegion.cols < refMat.cols || candidateRegion.rows < refMat.rows)
+    {
+        optimalMatch = InvalidPreviousMatch();
+        return;
+    }
+    try
+    {
+        cv::matchTemplate(candidateRegion, refMat, nVCCScores, cv::TM_CCOEFF_NORMED);
+    }
+    catch (const cv::Exception& ex)
+    {
+        LogTemplateMatchFailure("SearchMatchesPreviousFrame", ex, candidateRegion, "candidateRegion", refMat, "refMat");
+        optimalMatch = InvalidPreviousMatch();
+        return;
+    }
+    if (nVCCScores.empty())
+    {
+        optimalMatch = InvalidPreviousMatch();
+        return;
+    }
 
     int startRow = validRect.y + this->Vop2elMatcherParams.HalfPatchRows;
     int endRow = startRow + validRect.height - 2 * this->Vop2elMatcherParams.HalfPatchRows;
@@ -369,7 +475,7 @@ void Vop2elMatcher::SearchMatchesPreviousFrame(const cv::Mat& referencePatch,
 
     if (nVCCScoresAndKeyPoints.size() == 0)
     {
-        optimalMatch = std::pair<cv::Point2f, float>(cv::Point2f(-1.f, -1.f), std::numeric_limits<float>::lowest());
+        optimalMatch = InvalidPreviousMatch();
         return;
     }
 
@@ -588,12 +694,12 @@ void Vop2elMatcher::GetMatches(std::vector<Vop2el::Match>& matches)
                                             this->CameraParams.CalibrationMatrix, fundamental);
 
     int numCorrected = 0;
-    bool doContinue = true;
+    std::atomic<bool> doContinue(true);
 
     #pragma omp parallel for schedule(dynamic)
     for (int keyPointIdx = 0; keyPointIdx < this->PairWithKeyPoints.ActualLeftKeyPoints->size(); ++keyPointIdx)
     {
-        if (doContinue)
+        if (doContinue.load(std::memory_order_relaxed))
         {
             // Check wether keyPoint patch is inside the image
             cv::Point2f keyPoint = this->PairWithKeyPoints.ActualLeftKeyPoints->at(keyPointIdx);
@@ -604,6 +710,7 @@ void Vop2elMatcher::GetMatches(std::vector<Vop2el::Match>& matches)
             cv::Size patchSize(this->Vop2elMatcherParams.HalfPatchCols * 2 + 1, this->Vop2elMatcherParams.HalfPatchRows * 2 + 1);
             cv::Mat referencePatch;
             cv::getRectSubPix((*this->PairWithKeyPoints.ActualLeftImage), patchSize, keyPoint, referencePatch);
+            referencePatch = EnsureContinuous(referencePatch, "referencePatchMain");
 
             // Compute epipolar line of the keyPoint in the actual right image and get potential candidates matches
             double keyPointarr[3] = {keyPoint.x, keyPoint.y, 1};
@@ -649,8 +756,9 @@ void Vop2elMatcher::GetMatches(std::vector<Vop2el::Match>& matches)
                         if (keyPointMovement <= 1.f)
                             ++this->NumFixedKeyPoints;
 
-                        if (matchesAndIdx.size() > this->Vop2elMatcherParams.MaxNumberOfMatches)
-                            doContinue = false;
+                        if ((this->Vop2elMatcherParams.MaxNumberOfMatches >= 0) &&
+                            (matchesAndIdx.size() > static_cast<size_t>(this->Vop2elMatcherParams.MaxNumberOfMatches)))
+                            doContinue.store(false, std::memory_order_relaxed);
                     }
                 }
             }

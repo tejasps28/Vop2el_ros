@@ -22,6 +22,33 @@
 
 namespace Vop2el
 {
+namespace
+{
+// Ensure we store grayscale CV_8U images for matching.
+cv::Mat PrepareGray(const cv::Mat& image)
+{
+    if (image.empty())
+        return cv::Mat();
+
+    cv::Mat gray;
+    if (image.channels() == 1)
+        gray = image;
+    else if (image.channels() == 3)
+        cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+    else if (image.channels() == 4)
+        cv::cvtColor(image, gray, cv::COLOR_BGRA2GRAY);
+    else
+        cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+
+    if (gray.depth() != CV_8U)
+    {
+        cv::Mat gray8u;
+        gray.convertTo(gray8u, CV_8U);
+        return gray8u;
+    }
+    return gray;
+}
+}
 //---------------------------------------------------------------------------------------
 void StereoImagesHandler::AddStereoPair(const std::string& leftImagePath,
                                         const std::string& rightImagePath,
@@ -33,6 +60,39 @@ void StereoImagesHandler::AddStereoPair(const std::string& leftImagePath,
 
     this->LeftImages.push_back(std::make_shared<cv::Mat>(cv::imread(leftImagePath, cv::IMREAD_GRAYSCALE)));
     this->RightImages.push_back(std::make_shared<cv::Mat>(cv::imread(rightImagePath, cv::IMREAD_GRAYSCALE)));
+
+    if (computeLeftImageKeyPoints)
+    {
+        std::shared_ptr<std::vector<cv::Point2f>> leftImageKeyPoints;
+        this->ComputeGFTTKeyPoints(this->LeftImages.back(), leftImageKeyPoints);
+        this->LeftPrepImagesKeyPoints.emplace_back(leftImageKeyPoints);
+        ++this->LeftKeyPointsCount;
+    }
+
+    if (computeRightImageKeyPoints)
+    {
+        std::shared_ptr<std::vector<cv::Point2f>> rightImageKeyPoints;
+        this->ComputeGFTTKeyPoints(this->RightImages.back(), rightImageKeyPoints);
+        this->RightPrepImagesKeyPoints.emplace_back(rightImageKeyPoints);
+        ++this->RightKeyPointsCount;
+    }
+
+    ++this->FramesCount;
+}
+
+//---------------------------------------------------------------------------------------
+void StereoImagesHandler::AddStereoPair(const cv::Mat& leftImage,
+                                        const cv::Mat& rightImage,
+                                        bool computeLeftImageKeyPoints,
+                                        bool computeRightImageKeyPoints)
+{
+    if (this->FramesCount > this->StereoImagesHandlerParams.NumFramesCapacity)
+        this->Reset();
+
+    cv::Mat leftGray = PrepareGray(leftImage);
+    cv::Mat rightGray = PrepareGray(rightImage);
+    this->LeftImages.push_back(std::make_shared<cv::Mat>(leftGray.clone()));
+    this->RightImages.push_back(std::make_shared<cv::Mat>(rightGray.clone()));
 
     if (computeLeftImageKeyPoints)
     {

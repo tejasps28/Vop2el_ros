@@ -3,7 +3,6 @@
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/CameraInfo.h>
 #include <sensor_msgs/PointCloud.h>
-#include <sensor_msgs/Imu.h>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <geometry_msgs/TransformStamped.h>
@@ -112,14 +111,6 @@ public:
                                                        boost::placeholders::_1, boost::placeholders::_2));
         }
 
-        if (use_imu_)
-        {
-            const int imu_sub_queue = std::max(50, queue_size_ * 10);
-            imu_sub_ = nh_.subscribe(imu_topic_, imu_sub_queue, &Vop2elNode::ImuCallback, this);
-            ROS_INFO("IMU fusion enabled. imu_topic=%s weight=%.3f max_dt=%.3f",
-                     imu_topic_.c_str(), imu_orientation_weight_, imu_max_time_diff_);
-        }
-
         if (publish_odom_)
             odom_pub_ = nh_.advertise<nav_msgs::Odometry>(odom_topic_, 5, false);
         if (publish_path_)
@@ -163,7 +154,6 @@ private:
     image_transport::SubscriberFilter right_image_sub_;
     message_filters::Subscriber<sensor_msgs::CameraInfo> left_info_sub_;
     message_filters::Subscriber<sensor_msgs::CameraInfo> right_info_sub_;
-    ros::Subscriber imu_sub_;
     std::unique_ptr<SyncWithInfo> sync_with_info_;
     std::unique_ptr<SyncImages> sync_images_;
 
@@ -186,8 +176,6 @@ private:
     std::string right_image_topic_;
     std::string left_camera_info_topic_;
     std::string right_camera_info_topic_;
-    std::string imu_topic_;
-    std::string imu_frame_override_;
     std::string odom_topic_;
     std::string path_topic_;
     std::string features_topic_;
@@ -206,14 +194,10 @@ private:
     bool publish_features_image_ = true;
     bool publish_debug_ = true;
     bool use_camera_info_ = true;
-    bool use_imu_ = false;
     bool use_rectified_ = true;
     double tf_lookup_timeout_ = 0.1;
-    double imu_max_time_diff_ = 0.03;
-    double imu_orientation_weight_ = 0.2;
     int queue_size_ = 10;
     int input_buffer_size_ = 5;
-    int imu_queue_size_ = 400;
     bool drop_oldest_when_full_ = true;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
@@ -226,14 +210,6 @@ private:
     ros::WallTime last_process_wall_;
     bool has_last_process_wall_ = false;
     double processing_fps_ = 0.0;
-    std::mutex imu_mutex_;
-    std::deque<sensor_msgs::ImuConstPtr> imu_queue_;
-    bool imu_alignment_initialized_ = false;
-    Eigen::Quaterniond imu_to_vo_orientation_offset_ = Eigen::Quaterniond::Identity();
-    bool imu_to_base_rotation_cached_ = false;
-    std::string imu_to_base_rotation_source_frame_;
-    Eigen::Quaterniond imu_to_base_rotation_cached_q_ = Eigen::Quaterniond::Identity();
-    ros::WallTime last_imu_tf_lookup_attempt_wall_;
     std::vector<Eigen::Affine3d> published_poses_;
 
     void LoadParams()
@@ -242,8 +218,6 @@ private:
         pnh_.param("right_image_topic", right_image_topic_, std::string("/stereo/right/image_rect"));
         pnh_.param("left_camera_info_topic", left_camera_info_topic_, std::string("/stereo/left/camera_info"));
         pnh_.param("right_camera_info_topic", right_camera_info_topic_, std::string("/stereo/right/camera_info"));
-        pnh_.param("imu_topic", imu_topic_, std::string("/imu/data"));
-        pnh_.param("imu_frame_override", imu_frame_override_, std::string(""));
         pnh_.param("odom_topic", odom_topic_, std::string("/vo/odom"));
         pnh_.param("path_topic", path_topic_, std::string("/vo/path"));
         pnh_.param("features_topic", features_topic_, std::string("/vo/features"));
@@ -262,15 +236,12 @@ private:
         pnh_.param("publish_features_image", publish_features_image_, true);
         pnh_.param("publish_debug", publish_debug_, true);
         pnh_.param("use_camera_info", use_camera_info_, true);
-        pnh_.param("use_imu", use_imu_, false);
         pnh_.param("use_rectified", use_rectified_, true);
         pnh_.param("tf_lookup_timeout", tf_lookup_timeout_, 0.1);
-        pnh_.param("imu_max_time_diff", imu_max_time_diff_, 0.03);
-        pnh_.param("imu_orientation_weight", imu_orientation_weight_, 0.2);
         pnh_.param("queue_size", queue_size_, 10);
         pnh_.param("input_buffer_size", input_buffer_size_, 5);
-        pnh_.param("imu_queue_size", imu_queue_size_, 400);
         pnh_.param("drop_oldest_when_full", drop_oldest_when_full_, true);
+        pnh_.param("extrapolate_on_failure", params_.ExtrapolateOnFailure, params_.ExtrapolateOnFailure);
 
         if (!use_camera_info_)
         {
@@ -504,159 +475,6 @@ private:
         return true;
     }
 
-    void ImuCallback(const sensor_msgs::ImuConstPtr& msg)
-    {
-        if (!use_imu_)
-            return;
-
-        std::lock_guard<std::mutex> lock(imu_mutex_);
-        imu_queue_.push_back(msg);
-        const int max_size = std::max(50, imu_queue_size_);
-        while (static_cast<int>(imu_queue_.size()) > max_size)
-            imu_queue_.pop_front();
-    }
-
-    bool GetClosestImuSample(const ros::Time& stamp,
-                             sensor_msgs::ImuConstPtr& imu_msg,
-                             double& dt_sec)
-    {
-        std::lock_guard<std::mutex> lock(imu_mutex_);
-        if (imu_queue_.empty())
-            return false;
-
-        double best_abs_dt = std::numeric_limits<double>::infinity();
-        sensor_msgs::ImuConstPtr best;
-        for (const auto& sample : imu_queue_)
-        {
-            const double abs_dt = std::abs((sample->header.stamp - stamp).toSec());
-            if (abs_dt < best_abs_dt)
-            {
-                best_abs_dt = abs_dt;
-                best = sample;
-            }
-        }
-
-        if (!best || best_abs_dt > imu_max_time_diff_)
-            return false;
-
-        imu_msg = best;
-        dt_sec = best_abs_dt;
-        return true;
-    }
-
-    bool ResolveImuToBaseRotation(const std::string& imu_frame,
-                                  Eigen::Quaterniond& q_imu_to_base)
-    {
-        if (imu_frame == base_frame_)
-        {
-            q_imu_to_base = Eigen::Quaterniond::Identity();
-            return true;
-        }
-
-        if (imu_to_base_rotation_cached_ && imu_to_base_rotation_source_frame_ == imu_frame)
-        {
-            q_imu_to_base = imu_to_base_rotation_cached_q_;
-            return true;
-        }
-
-        const ros::WallTime now = ros::WallTime::now();
-        if (!last_imu_tf_lookup_attempt_wall_.isZero() &&
-            (now - last_imu_tf_lookup_attempt_wall_).toSec() < 0.2)
-        {
-            return false;
-        }
-        last_imu_tf_lookup_attempt_wall_ = now;
-
-        geometry_msgs::TransformStamped tf_imu_to_base;
-        try
-        {
-            tf_imu_to_base = tf_buffer_.lookupTransform(base_frame_, imu_frame,
-                                                        ros::Time(0), ros::Duration(0.0));
-        }
-        catch (const tf2::TransformException& ex)
-        {
-            ROS_WARN_THROTTLE(2.0, "IMU TF lookup failed (non-blocking): %s", ex.what());
-            return false;
-        }
-
-        Eigen::Quaterniond q(tf_imu_to_base.transform.rotation.w,
-                             tf_imu_to_base.transform.rotation.x,
-                             tf_imu_to_base.transform.rotation.y,
-                             tf_imu_to_base.transform.rotation.z);
-        if (!std::isfinite(q.norm()) || q.norm() < 1e-9)
-            return false;
-        q.normalize();
-
-        imu_to_base_rotation_cached_q_ = q;
-        imu_to_base_rotation_source_frame_ = imu_frame;
-        imu_to_base_rotation_cached_ = true;
-        q_imu_to_base = q;
-        return true;
-    }
-
-    bool TryFuseImuOrientation(const ros::Time& stamp,
-                               Eigen::Affine3d& pose_in_out,
-                               bool& imu_used,
-                               double& imu_dt_sec)
-    {
-        imu_used = false;
-        imu_dt_sec = -1.0;
-
-        if (!use_imu_)
-            return false;
-
-        sensor_msgs::ImuConstPtr imu_msg;
-        if (!GetClosestImuSample(stamp, imu_msg, imu_dt_sec))
-            return false;
-
-        if (imu_msg->orientation_covariance[0] < 0.0)
-            return false;
-
-        Eigen::Quaterniond q_world_imu(imu_msg->orientation.w,
-                                       imu_msg->orientation.x,
-                                       imu_msg->orientation.y,
-                                       imu_msg->orientation.z);
-        if (!std::isfinite(q_world_imu.norm()) || q_world_imu.norm() < 1e-9)
-            return false;
-        q_world_imu.normalize();
-
-        std::string imu_frame = imu_frame_override_.empty() ? imu_msg->header.frame_id : imu_frame_override_;
-        if (imu_frame.empty())
-            imu_frame = base_frame_;
-
-        Eigen::Quaterniond q_imu_to_base = Eigen::Quaterniond::Identity();
-        if (!ResolveImuToBaseRotation(imu_frame, q_imu_to_base))
-            return false;
-
-        const Eigen::Quaterniond q_world_base_from_imu = q_world_imu * q_imu_to_base;
-
-        Eigen::Quaterniond q_vo_world_base(pose_in_out.rotation());
-        if (!std::isfinite(q_vo_world_base.norm()) || q_vo_world_base.norm() < 1e-9)
-            return false;
-        q_vo_world_base.normalize();
-
-        if (!imu_alignment_initialized_)
-        {
-            imu_to_vo_orientation_offset_ = q_vo_world_base * q_world_base_from_imu.inverse();
-            imu_alignment_initialized_ = true;
-        }
-
-        Eigen::Quaterniond q_imu_mapped = imu_to_vo_orientation_offset_ * q_world_base_from_imu;
-        if (!std::isfinite(q_imu_mapped.norm()) || q_imu_mapped.norm() < 1e-9)
-            return false;
-        q_imu_mapped.normalize();
-
-        const double w = std::max(0.0, std::min(1.0, imu_orientation_weight_));
-        Eigen::Quaterniond q_fused = q_vo_world_base.slerp(w, q_imu_mapped);
-        if (!std::isfinite(q_fused.norm()) || q_fused.norm() < 1e-9)
-            return false;
-        q_fused.normalize();
-
-        pose_in_out.linear() = q_fused.toRotationMatrix();
-        imu_used = true;
-        return true;
-    }
-
     void EnqueueStereoPair(const sensor_msgs::ImageConstPtr& left_msg,
                            const sensor_msgs::ImageConstPtr& right_msg)
     {
@@ -748,8 +566,9 @@ private:
                       size_t pose_count,
                       int match_count,
                       int inlier_count,
-                      bool imu_used,
-                      double imu_dt_sec)
+                      bool fallback_used,
+                      bool extrapolated_on_failure,
+                      int failure_reason)
     {
         if (!publish_debug_ || !debug_pub_)
             return;
@@ -759,12 +578,6 @@ private:
             std::lock_guard<std::mutex> lock(queue_mutex_);
             queue_depth = frame_queue_.size();
         }
-        size_t imu_queue_depth = 0;
-        {
-            std::lock_guard<std::mutex> lock(imu_mutex_);
-            imu_queue_depth = imu_queue_.size();
-        }
-
         diagnostic_msgs::DiagnosticArray diag;
         diag.header.stamp = stamp;
 
@@ -784,7 +597,6 @@ private:
 
         add_key_value("queue_depth", std::to_string(queue_depth));
         add_key_value("input_buffer_size", std::to_string(input_buffer_size_));
-        add_key_value("imu_queue_depth", std::to_string(imu_queue_depth));
         add_key_value("frames_enqueued", std::to_string(frames_enqueued_.load(std::memory_order_relaxed)));
         add_key_value("frames_processed", std::to_string(frames_processed_.load(std::memory_order_relaxed)));
         add_key_value("frames_dropped", std::to_string(frames_dropped_.load(std::memory_order_relaxed)));
@@ -792,12 +604,12 @@ private:
         add_key_value("feature_count", std::to_string(feature_count));
         add_key_value("match_count", std::to_string(match_count));
         add_key_value("inlier_count", std::to_string(inlier_count));
+        add_key_value("fallback_used", fallback_used ? "true" : "false");
+        add_key_value("extrapolated_on_failure", extrapolated_on_failure ? "true" : "false");
+        add_key_value("failure_reason", std::to_string(failure_reason));
+        add_key_value("extrapolate_on_failure", params_.ExtrapolateOnFailure ? "true" : "false");
         add_key_value("pose_count", std::to_string(pose_count));
         add_key_value("use_camera_info", use_camera_info_ ? "true" : "false");
-        add_key_value("use_imu", use_imu_ ? "true" : "false");
-        add_key_value("imu_used", imu_used ? "true" : "false");
-        add_key_value("imu_dt_sec", std::to_string(imu_dt_sec));
-        add_key_value("imu_tf_cached", imu_to_base_rotation_cached_ ? "true" : "false");
         add_key_value("use_rectified", use_rectified_ ? "true" : "false");
 
         diag.status.push_back(status);
@@ -841,9 +653,6 @@ private:
         has_last_process_wall_ = true;
 
         Eigen::Affine3d abs_pose = poses.back();
-        bool imu_used = false;
-        double imu_dt_sec = -1.0;
-        TryFuseImuOrientation(stamp, abs_pose, imu_used, imu_dt_sec);
         published_poses_.push_back(abs_pose);
 
         if (publish_odom_)
@@ -887,7 +696,7 @@ private:
         PublishFeaturesImage(left_image, features, stamp);
         PublishDebug(stamp, features.size(), published_poses_.size(),
                      frame_stats.MatchCount, frame_stats.InlierCount,
-                     imu_used, imu_dt_sec);
+                     frame_stats.UsedFallback, frame_stats.UsedExtrapolation, frame_stats.FailureReason);
     }
 
     void ProcessingLoop()

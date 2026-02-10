@@ -56,8 +56,8 @@ struct EssentielMatrixOptimizer
     T actImageResidus = epipolarLineActImage.dot(ActImagePointCoor) /
                               ceres::sqrt(ceres::pow(epipolarLineActImage[0], 2) + ceres::pow(epipolarLineActImage[1], 2));
 
-    residual[0] = !ceres::isinf(refImageResidus) ? refImageResidus : T(0.0);
-    residual[1] = !ceres::isinf(actImageResidus) ? actImageResidus : T(0.0);
+    residual[0] = ceres::IsFinite(refImageResidus) ? refImageResidus : T(0.0);
+    residual[1] = ceres::IsFinite(actImageResidus) ? actImageResidus : T(0.0);
 
     return true;
   }
@@ -112,8 +112,8 @@ struct ScaleCostPreviousLeftActualRight
     T actImageResidus = epipolarLineActImage.dot(ActImagePointCoor) /
                               ceres::sqrt(ceres::pow(epipolarLineActImage[0], 2) + ceres::pow(epipolarLineActImage[1], 2));
 
-    residual[0] = !ceres::isinf(refImageResidus) ? refImageResidus : T(0.0);
-    residual[1] = !ceres::isinf(actImageResidus) ? actImageResidus : T(0.0);
+    residual[0] = ceres::IsFinite(refImageResidus) ? refImageResidus : T(0.0);
+    residual[1] = ceres::IsFinite(actImageResidus) ? actImageResidus : T(0.0);
 
     return true;
   }
@@ -167,8 +167,8 @@ struct ScaleCostActualLeftPreviousRight
     T actImageResidus =  epipolarLineRefImage.dot(RefImagePointCoor) /
                               ceres::sqrt(ceres::pow(epipolarLineRefImage[0], 2) + ceres::pow(epipolarLineRefImage[1], 2));
 
-    residual[0] = !ceres::isinf(refImageResidus) ? refImageResidus : T(0.0);
-    residual[1] = !ceres::isinf(actImageResidus) ? actImageResidus : T(0.0);
+    residual[0] = ceres::IsFinite(refImageResidus) ? refImageResidus : T(0.0);
+    residual[1] = ceres::IsFinite(actImageResidus) ? actImageResidus : T(0.0);
 
     return true;
   }
@@ -222,8 +222,8 @@ struct ScaleCostPreviousRightActualRight
     T actImageResidus =  epipolarLineRefImage.dot(RefImagePointCoor) /
                               ceres::sqrt(ceres::pow(epipolarLineRefImage[0], 2) + ceres::pow(epipolarLineRefImage[1], 2));
 
-    residual[0] = !ceres::isinf(refImageResidus) ? refImageResidus : T(0.0);
-    residual[1] = !ceres::isinf(actImageResidus) ? actImageResidus : T(0.0);
+    residual[0] = ceres::IsFinite(refImageResidus) ? refImageResidus : T(0.0);
+    residual[1] = ceres::IsFinite(actImageResidus) ? actImageResidus : T(0.0);
 
     return true;
   }

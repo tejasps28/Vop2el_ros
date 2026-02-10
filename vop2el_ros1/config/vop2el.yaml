@@ -3,8 +3,6 @@ left_image_topic: /kitti/camera_gray_left/image_raw #/stereo/left/image_rect
 right_image_topic: /kitti/camera_gray_right/image_raw #/stereo/right/image_rect
 left_camera_info_topic: /kitti/camera_gray_left/camera_info #/stereo/left/camera_info
 right_camera_info_topic: /kitti/camera_gray_right/camera_info #/stereo/right/camera_info
-imu_topic: /kitti/oxts/imu
-imu_frame_override: ""
 
 # Optional: path to the original Vop2el INI file. If set, all algorithm parameters
 # (optical flow, matcher, cost, stereo handler, ground plane) are loaded from the INI.
@@ -12,7 +10,6 @@ ini_file: /volp2el_ws/src/Vop2el_ros/my_files/Vop2elParameters.txt
 # true: read intrinsics/extrinsics from CameraInfo/TF (ROS-native mode)
 # false: use original INI/TXT camera parameters; only image topics are needed
 use_camera_info: false
-use_imu: true
 
 # Frame overrides (optional). If empty, use frame_id from CameraInfo.
 left_frame_override: ""
@@ -37,15 +34,15 @@ publish_debug: true
 queue_size: 10
 # Active stereo frame buffer (push/pop queue used by wrapper before VO processing)
 input_buffer_size: 5
-imu_queue_size: 400
 drop_oldest_when_full: false #true
+# On VO failure (low matches/OpenCV exception):
+# false = hold pose (prevents runaway drift cascade)
+extrapolate_on_failure: false
 # If true, extrinsics are derived from right CameraInfo P matrix (rectified stereo).
 # If false, extrinsics are fetched from TF between left/right camera frames.
 use_rectified: true
 # TF lookup timeout in seconds (only used when use_rectified is false).
 tf_lookup_timeout: 0.1
-imu_max_time_diff: 0.03
-imu_orientation_weight: 0.2
 
 # Sliding window optimization (pose-only)
 sliding_window:

@@ -143,7 +143,7 @@ int main(int argc, char** argv)
     }
 
     // Get computed poses
-    const std::vector<Eigen::Affine3d>& estimatedPoses = algorithm.GetPoses();
+    const std::vector<Eigen::Affine3d> estimatedPoses = algorithm.GetPosesCopy();
     Utils::WritePosesAsTransform(estimatedPoses, argv[4]);
 
     return 0;

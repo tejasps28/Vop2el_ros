@@ -18,6 +18,33 @@ This project has been tested and verified to build successfully on Ubuntu 20.04 
 
 - For OpenCV, we use a slightly modified version that will be built during the build of this project.
 
+## OpenCV (custom fork)
+
+This repo uses a custom OpenCV fork as a git submodule at `third-party/opencv`:
+
+- URL: `https://github.com/Vop2elToolkit/opencv.git`
+- Branch: `feat/RansacReturnsAllInliers`
+
+To download the exact version pinned by this repo:
+
+```bash
+git submodule update --init --recursive
+```
+
+To verify which commit you have:
+
+```bash
+git -C third-party/opencv rev-parse --short HEAD
+```
+
+If you explicitly want the latest commit from the forked branch instead of the pinned version:
+
+```bash
+git -C third-party/opencv fetch origin feat/RansacReturnsAllInliers
+git -C third-party/opencv checkout feat/RansacReturnsAllInliers
+git -C third-party/opencv pull
+```
+
 ## Build and install
 
 To build and install this project on linux, follow the steps below:
@@ -51,6 +78,64 @@ Download the Rerun viewer (version 0.17.0) from https://github.com/rerun-io/reru
 cmake ../Vop2el
 
 cmake --build .
+```
+
+## Docker (ROS Noetic)
+
+If you want to run inside Docker using the provided compose file:
+
+```bash
+ROS_IMAGE=osrf/ros:noetic-desktop-full docker compose -f Vop2el_ros/docker-compose.yml up -d
+docker compose -f Vop2el_ros/docker-compose.yml exec ros1 bash
+```
+
+This mounts:
+
+- Workspace: `/home/tejas/project_workspaces/personal_github/volp2el_ws` -> `/workspaces/volp2el_ws`
+- Datasets: `/home/tejas/project_workspaces/datasets` -> `/datasets` (read-only)
+
+If you need GUI tools (rviz/rqt), run `xhost +local:root` on the host before starting the container.
+
+## ROS1 Wrapper (Realtime Buffer)
+
+The ROS1 wrapper can run in two modes:
+
+- `use_camera_info: true`: intrinsics/extrinsics come from ROS `CameraInfo` (+ TF when `use_rectified: false`).
+- `use_camera_info: false`: use original Vop2el INI/TXT calibration only (image topics only).
+
+For an original-style setup (INI/TXT + realtime image stream), set in `vop2el_ros1/config/vop2el.yaml`:
+
+- `ini_file: /volp2el_ws/src/Vop2el_ros/my_files/Vop2elParameters.txt`
+- `use_camera_info: false`
+- `input_buffer_size: 5`
+- `drop_oldest_when_full: true`
+- `extrapolate_on_failure: false` (recommended; holds pose on tracking failure instead of repeating last motion)
+
+Build and run inside the container:
+
+```bash
+source /opt/ros/noetic/setup.bash
+cd /volp2el_ws
+catkin_make -DCMAKE_BUILD_TYPE=Release
+source devel/setup.bash
+roslaunch vop2el_ros1 vop2el.launch
+```
+
+Published outputs:
+
+- Odometry: `/vo/odom`
+- Path: `/vo/path`
+- Features: `/vo/features` (`sensor_msgs/PointCloud`, x/y are image pixel coordinates)
+- Feature overlay image: `/vo/features_image` (`sensor_msgs/Image`, green dots over left image)
+- Debug stats: `/vo/debug` (`diagnostic_msgs/DiagnosticArray`), including:
+- `match_count`, `inlier_count`, `fallback_used`, `extrapolated_on_failure`, `failure_reason`
+
+Example rosbag playback (`use_camera_info: false`):
+
+```bash
+rosbag play /datasets/<your_bag>.bag --clock \
+  /kitti/camera_gray_left/image_raw \
+  /kitti/camera_gray_right/image_raw
 ```
 
 ## Run

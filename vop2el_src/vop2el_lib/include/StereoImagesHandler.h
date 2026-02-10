@@ -43,6 +43,11 @@ class StereoImagesHandler
                         const std::string& rightImagePath,
                         bool computeLeftImageKeyPoints = true,
                         bool computeRightImageKeyPoints = true);
+        // Add a stereo pair from in-memory images (expects grayscale or will convert)
+        void AddStereoPair(const cv::Mat& leftImage,
+                        const cv::Mat& rightImage,
+                        bool computeLeftImageKeyPoints = true,
+                        bool computeRightImageKeyPoints = true);
         // Get left image from given index
         std::shared_ptr<const cv::Mat> GetLeftImage(int imageIndex) const;
         // Get right image from given index

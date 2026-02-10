@@ -24,6 +24,10 @@
 #include <ceres/ceres.h>
 #include <opencv2/features2d.hpp>
 #include <Eigen/Dense>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <deque>
 
 #include "Vop2elMatcher.h"
 #include "StereoImagesHandler.h"
@@ -51,22 +55,47 @@ struct Vop2elParameters
     Common::Camera CameraParams; // stereo camera parameters
     Vop2el::StereoImagesHandlerParameters StereoImagesHandlerParams; // stereo images handler
     Vop2el::Vop2elMatcherParameters Vop2elMatcherParams; // matcher parameters
+    bool EnableSlidingWindow = false; // enable pose-only sliding window optimization
+    int SlidingWindowSize = 6; // number of poses in the sliding window
+    bool SlidingWindowBackground = true; // run optimization in background thread
+    bool ExtrapolateOnFailure = true; // when tracking fails: true=reuse last motion, false=hold pose (identity delta)
 };
 
 class Vop2elAlgorithm
 {
     public:
+        struct FrameDebugStats
+        {
+            int MatchCount = 0;
+            int InlierCount = 0;
+            bool UsedFallback = false;
+            bool UsedExtrapolation = false;
+            int FailureReason = 0; // 0=ok,1=low_matches,2=low_inliers,3=too_many_fixed,4=cv_init,5=cv_refine
+        };
+
         Vop2elAlgorithm(const Vop2el::Vop2elParameters& vop2elParams) :
         Vop2elParams(vop2elParams), FramesHandler(vop2elParams.StereoImagesHandlerParams) {}
+        ~Vop2elAlgorithm();
 
         // Compute relative/absolute transform between previous frame and actual frame
         void ProcessStereoFrame(const std::string& leftImage,
                                 const std::string& rightImage,
                                 Eigen::Affine3d& relativeTransform);
+        // Compute relative/absolute transform between previous frame and actual frame (in-memory images)
+        void ProcessStereoFrame(const cv::Mat& leftImage,
+                                const cv::Mat& rightImage,
+                                Eigen::Affine3d& relativeTransform);
         // Get absolute poses
         const std::vector<Eigen::Affine3d>& GetPoses() const { return this->AbsolutePoses; }
+        // Thread-safe copy of poses
+        std::vector<Eigen::Affine3d> GetPosesCopy() const;
+        // Copy latest detected keypoints on left image (current frame)
+        std::vector<cv::Point2f> GetLatestLeftKeyPointsCopy() const;
+        // Copy latest frame matcher/inlier stats
+        FrameDebugStats GetLastFrameDebugStats() const;
         // Get current absolute pose
-        Eigen::Affine3d GetCurrentAbsPose() const { return this->AbsolutePoses.back(); }
+        Eigen::Affine3d GetCurrentAbsPose() const;
+        Eigen::Affine3d GetCurrentAbsPoseCopy() const { return GetCurrentAbsPose(); }
 
     private:
         // Frames handler
@@ -79,6 +108,18 @@ class Vop2elAlgorithm
         std::vector<Eigen::Affine3d> RelativePoses;
         // Absolute poses
         std::vector<Eigen::Affine3d> AbsolutePoses;
+        // Sliding-window explicit push/pop buffers.
+        std::deque<Eigen::Affine3d> WindowPoses;
+        std::deque<Eigen::Affine3d> WindowRelPoses;
+        int WindowStartIndex = 0;
+        // Protect pose vectors when background optimization is enabled
+        mutable std::mutex PosesMutex;
+        // Protect latest frame debug stats
+        mutable std::mutex StatsMutex;
+        FrameDebugStats LastFrameDebugStats;
+        // Background optimization state
+        std::atomic<bool> OptimizationInProgress{false};
+        std::thread OptimizerThread;
 
         // Compute matches using vop2el matcher
         void ComputeMatchesUsingVop2elMatcher(const Vop2el::StereoImagesPairWithKeyPoints& imagesWithKeyPoints,
@@ -114,6 +155,13 @@ class Vop2elAlgorithm
         // Estimate intial scaled relative transform
         void EstimateInitScaledRelativeTransform(Eigen::Affine3d& initialRelativeTransform) const;
         // Extrapolate relative/absolute pose when number of valid matches computed by the matcher is insufficient
-        void ProcessNumMatchesInsufficient();
+        bool ProcessNumMatchesInsufficient();
+        // Sliding window optimization
+        void MaybeOptimizeSlidingWindow();
+        void OptimizeSlidingWindowThread(int startIndex, int windowSize,
+                                        const std::vector<Eigen::Affine3d>& windowPoses,
+                                        const std::vector<Eigen::Affine3d>& windowRelPoses);
+        void PushPoseToWindow(const Eigen::Affine3d& absolutePose, const Eigen::Affine3d* relativePose);
+        void SetLastFrameDebugStats(int matchCount, int inlierCount, bool usedFallback, bool usedExtrapolation, int failureReason);
 };
-}
+} 
