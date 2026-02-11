@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
+  rospy
   sensor_msgs
   diagnostic_msgs
   nav_msgs
@@ -24,7 +25,7 @@ find_package(Ceres REQUIRED)
 find_package(OpenMP REQUIRED)
 
 catkin_package(
-  CATKIN_DEPENDS roscpp sensor_msgs diagnostic_msgs nav_msgs geometry_msgs tf2_ros tf2_geometry_msgs image_transport cv_bridge message_filters
+  CATKIN_DEPENDS roscpp rospy sensor_msgs diagnostic_msgs nav_msgs geometry_msgs tf2_ros tf2_geometry_msgs image_transport cv_bridge message_filters
 )
 
 set(VOP2EL_CORE_SOURCES
@@ -71,6 +72,16 @@ target_link_libraries(vop2el_node
 
 install(TARGETS vop2el_node
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+catkin_install_python(PROGRAMS
+  scripts/odom_to_tum.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(PROGRAMS
+  scripts/record_debug_stats.sh
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
 install(DIRECTORY config launch

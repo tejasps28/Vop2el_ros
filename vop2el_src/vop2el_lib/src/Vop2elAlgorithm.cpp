@@ -21,6 +21,7 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
 
 #include "Vop2elAlgorithm.h"
 #include "Common.h"
@@ -30,6 +31,40 @@ namespace Vop2el
 {
 namespace
 {
+int GetSolverNumThreads()
+{
+    static int configured_threads = []()
+    {
+        const char* env = std::getenv("VOP2EL_NUM_THREADS");
+        if (env != nullptr)
+        {
+            const int parsed = std::atoi(env);
+            if (parsed > 0)
+                return parsed;
+        }
+
+        const unsigned int hw = std::thread::hardware_concurrency();
+        if (hw == 0u)
+            return 1;
+        return static_cast<int>(std::min<unsigned int>(hw, 4u));
+    }();
+    return configured_threads;
+}
+
+void LogFallbackWarning(bool extrapolate_on_failure)
+{
+    static std::atomic<int> warning_counter{0};
+    const int count = warning_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 5 || (count % 50) == 0)
+    {
+        std::cerr << "[WARNING] The number of computed matches is insufficient. "
+                  << (extrapolate_on_failure ? "Applying last-motion extrapolation." : "Holding pose (identity fallback).")
+                  << std::endl;
+        if (count == 5)
+            std::cerr << "[WARNING] Suppressing frequent fallback warnings; logging every 50 events." << std::endl;
+    }
+}
+
 struct RelativePoseCost
 {
     RelativePoseCost(const Eigen::Quaterniond& q_meas, const Eigen::Vector3d& t_meas)
@@ -205,7 +240,7 @@ double Vop2elAlgorithm::EstimateInitScale(const Eigen::Affine3d& transformPrevio
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_QR;
-    options.num_threads = std::thread::hardware_concurrency();
+    options.num_threads = GetSolverNumThreads();
     ceres::Solver::Summary summary;
     options.max_num_iterations = this->Vop2elParams.CostFunctionsMaxNumIterations;
     ceres::Solve(options, &problem, &summary);
@@ -258,7 +293,7 @@ void Vop2elAlgorithm::OptimizeEssentielMatrix(const cv::Mat& essentielMatrix,
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_QR;
-    options.num_threads = std::thread::hardware_concurrency();
+    options.num_threads = GetSolverNumThreads();
     options.max_num_iterations = this->Vop2elParams.CostFunctionsMaxNumIterations;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -353,7 +388,7 @@ double Vop2elAlgorithm::ComputeScale(const Eigen::Affine3d& transformPreviousAct
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_QR;
-    options.num_threads = std::thread::hardware_concurrency();
+    options.num_threads = GetSolverNumThreads();
     ceres::Solver::Summary summary;
     options.max_num_iterations = this->Vop2elParams.CostFunctionsMaxNumIterations;
     ceres::Solve(options, &problem, &summary);
@@ -401,9 +436,7 @@ void Vop2elAlgorithm::EstimateInitScaledRelativeTransform(Eigen::Affine3d& initi
 //-------------------------------------------------------------------------------------------
 bool Vop2elAlgorithm::ProcessNumMatchesInsufficient()
 {
-    std::cerr << "[WARNING] The number of computed matches is insufficient. "
-              << (this->Vop2elParams.ExtrapolateOnFailure ? "Applying last-motion extrapolation." : "Holding pose (identity fallback).")
-              << std::endl;
+    LogFallbackWarning(this->Vop2elParams.ExtrapolateOnFailure);
     std::lock_guard<std::mutex> lock(this->PosesMutex);
     Eigen::Affine3d fallbackRelative = Eigen::Affine3d::Identity();
     bool usedExtrapolation = false;
@@ -464,8 +497,6 @@ void Vop2elAlgorithm::ProcessStereoFrame(const std::string& leftImage,
             this->MaybeOptimizeSlidingWindow();
             return;
         }
-
-        std::cout << "Number of matches: " <<  matches.size() << std::endl;
 
         if (matches.size() < 10)
         {
@@ -583,8 +614,6 @@ void Vop2elAlgorithm::ProcessStereoFrame(const cv::Mat& leftImage,
             this->MaybeOptimizeSlidingWindow();
             return;
         }
-
-        std::cout << "Number of matches: " <<  matches.size() << std::endl;
 
         if (matches.size() < 10)
         {
@@ -831,7 +860,7 @@ void Vop2elAlgorithm::OptimizeSlidingWindowThread(int startIndex, int windowSize
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_QR;
     options.max_num_iterations = 30;
-    options.num_threads = std::thread::hardware_concurrency();
+    options.num_threads = GetSolverNumThreads();
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);

@@ -1,0 +1,13 @@
+<launch>
+  <arg name="config" default="$(find vop2el_ros1)/config/vop2el.yaml"/>
+  <arg name="bag_file" default="$(env HOME)/.ros/vop2el_debug.bag"/>
+  <arg name="record_topics" default="/vo/debug /vo/odom /vo/path /vo/features"/>
+
+  <include file="$(find vop2el_ros1)/launch/vop2el.launch">
+    <arg name="config" value="$(arg config)"/>
+    <arg name="publish_debug" value="true"/>
+  </include>
+
+  <node pkg="rosbag" type="record" name="vop2el_debug_recorder" output="screen"
+        args="-O $(arg bag_file) $(arg record_topics)"/>
+</launch>

@@ -19,10 +19,12 @@
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
+#include <message_filters/sync_policies/exact_time.h>
 
 #include <image_transport/image_transport.h>
 #include <image_transport/subscriber_filter.h>
 #include <cv_bridge/cv_bridge.h>
+#include <sensor_msgs/image_encodings.h>
 
 #include <opencv2/opencv.hpp>
 #include <Eigen/Dense>
@@ -37,6 +39,8 @@
 #include <atomic>
 #include <cmath>
 #include <limits>
+#include <string>
+#include <cctype>
 
 #include "Vop2elAlgorithm.h"
 #include "Common.h"
@@ -87,12 +91,12 @@ public:
     {
         LoadParams();
 
-        left_image_sub_.subscribe(it_, left_image_topic_, 1);
-        right_image_sub_.subscribe(it_, right_image_topic_, 1);
+        left_image_sub_.subscribe(it_, left_image_topic_, queue_size_);
+        right_image_sub_.subscribe(it_, right_image_topic_, queue_size_);
         if (use_camera_info_)
         {
-            left_info_sub_.subscribe(nh_, left_camera_info_topic_, 1);
-            right_info_sub_.subscribe(nh_, right_camera_info_topic_, 1);
+            left_info_sub_.subscribe(nh_, left_camera_info_topic_, queue_size_);
+            right_info_sub_.subscribe(nh_, right_camera_info_topic_, queue_size_);
             sync_with_info_.reset(new SyncWithInfo(SyncPolicyWithInfo(queue_size_),
                                                    left_image_sub_, right_image_sub_, left_info_sub_, right_info_sub_));
             sync_with_info_->registerCallback(boost::bind(&Vop2elNode::StereoWithInfoCallback, this,
@@ -106,9 +110,18 @@ public:
                 algorithm_.reset(new Vop2el::Vop2elAlgorithm(params_));
                 camera_ready_ = true;
             }
-            sync_images_.reset(new SyncImages(SyncPolicyImages(queue_size_), left_image_sub_, right_image_sub_));
-            sync_images_->registerCallback(boost::bind(&Vop2elNode::StereoImagesCallback, this,
-                                                       boost::placeholders::_1, boost::placeholders::_2));
+            if (sync_policy_ == "exact")
+            {
+                sync_images_exact_.reset(new SyncImagesExact(SyncPolicyImagesExact(queue_size_), left_image_sub_, right_image_sub_));
+                sync_images_exact_->registerCallback(boost::bind(&Vop2elNode::StereoImagesCallback, this,
+                                                                 boost::placeholders::_1, boost::placeholders::_2));
+            }
+            else
+            {
+                sync_images_approx_.reset(new SyncImagesApprox(SyncPolicyImagesApprox(queue_size_), left_image_sub_, right_image_sub_));
+                sync_images_approx_->registerCallback(boost::bind(&Vop2elNode::StereoImagesCallback, this,
+                                                                  boost::placeholders::_1, boost::placeholders::_2));
+            }
         }
 
         if (publish_odom_)
@@ -136,14 +149,22 @@ private:
                                                                               sensor_msgs::CameraInfo,
                                                                               sensor_msgs::CameraInfo>;
     using SyncWithInfo = message_filters::Synchronizer<SyncPolicyWithInfo>;
-    using SyncPolicyImages = message_filters::sync_policies::ApproximateTime<sensor_msgs::Image,
-                                                                            sensor_msgs::Image>;
-    using SyncImages = message_filters::Synchronizer<SyncPolicyImages>;
+    using SyncPolicyImagesApprox = message_filters::sync_policies::ApproximateTime<sensor_msgs::Image,
+                                                                                   sensor_msgs::Image>;
+    using SyncImagesApprox = message_filters::Synchronizer<SyncPolicyImagesApprox>;
+    using SyncPolicyImagesExact = message_filters::sync_policies::ExactTime<sensor_msgs::Image,
+                                                                           sensor_msgs::Image>;
+    using SyncImagesExact = message_filters::Synchronizer<SyncPolicyImagesExact>;
     struct BufferedStereoFrame
     {
         cv::Mat left;
         cv::Mat right;
         ros::Time stamp;
+    };
+    struct SelectorCandidate
+    {
+        BufferedStereoFrame frame;
+        double score = 0.0;
     };
 
     ros::NodeHandle nh_;
@@ -155,7 +176,8 @@ private:
     message_filters::Subscriber<sensor_msgs::CameraInfo> left_info_sub_;
     message_filters::Subscriber<sensor_msgs::CameraInfo> right_info_sub_;
     std::unique_ptr<SyncWithInfo> sync_with_info_;
-    std::unique_ptr<SyncImages> sync_images_;
+    std::unique_ptr<SyncImagesApprox> sync_images_approx_;
+    std::unique_ptr<SyncImagesExact> sync_images_exact_;
 
     ros::Publisher odom_pub_;
     ros::Publisher path_pub_;
@@ -198,18 +220,43 @@ private:
     double tf_lookup_timeout_ = 0.1;
     int queue_size_ = 10;
     int input_buffer_size_ = 5;
+    int process_every_n_ = 1;
+    double target_process_rate_hz_ = 0.0;
+    std::string sync_policy_ = "exact";
+    double max_stereo_dt_sec_ = 0.002;
+    bool force_grayscale_ = true;
+    std::string selector_mode_ = "stride";
+    int selection_buffer_size_ = 3;
+    double selection_max_latency_sec_ = 0.15;
+    double min_sharpness_ = 0.0;
+    double min_brightness_ = -1.0;
+    double max_brightness_ = 256.0;
+    int path_publish_stride_ = 1;
+    bool skip_publish_on_fallback_ = false;
     bool drop_oldest_when_full_ = true;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::deque<BufferedStereoFrame> frame_queue_;
+    std::mutex selector_mutex_;
+    ros::Time last_selected_stamp_;
+    std::deque<SelectorCandidate> selector_candidates_;
     bool worker_running_ = true;
     std::thread worker_thread_;
+    std::atomic<uint64_t> frames_received_{0};
+    std::atomic<uint64_t> frames_skipped_selector_{0};
+    std::atomic<uint64_t> frames_rejected_quality_{0};
+    std::atomic<uint64_t> frames_selected_quality_buffer_{0};
+    std::atomic<uint64_t> frames_skipped_desync_{0};
     std::atomic<uint64_t> frames_enqueued_{0};
     std::atomic<uint64_t> frames_dropped_{0};
     std::atomic<uint64_t> frames_processed_{0};
+    std::atomic<uint64_t> frames_published_{0};
+    std::atomic<uint64_t> frames_skipped_publish_fallback_{0};
     ros::WallTime last_process_wall_;
     bool has_last_process_wall_ = false;
     double processing_fps_ = 0.0;
+    uint64_t path_publish_counter_ = 0;
+    nav_msgs::Path path_msg_;
     std::vector<Eigen::Affine3d> published_poses_;
 
     void LoadParams()
@@ -240,144 +287,77 @@ private:
         pnh_.param("tf_lookup_timeout", tf_lookup_timeout_, 0.1);
         pnh_.param("queue_size", queue_size_, 10);
         pnh_.param("input_buffer_size", input_buffer_size_, 5);
+        pnh_.param("process_every_n", process_every_n_, 1);
+        pnh_.param("target_process_rate_hz", target_process_rate_hz_, 0.0);
+        pnh_.param("sync_policy", sync_policy_, std::string("exact"));
+        pnh_.param("max_stereo_dt_sec", max_stereo_dt_sec_, 0.002);
+        pnh_.param("force_grayscale", force_grayscale_, true);
+        pnh_.param("selector_mode", selector_mode_, std::string("stride"));
+        pnh_.param("selection_buffer_size", selection_buffer_size_, 3);
+        pnh_.param("selection_max_latency_sec", selection_max_latency_sec_, 0.15);
+        pnh_.param("min_sharpness", min_sharpness_, 0.0);
+        pnh_.param("min_brightness", min_brightness_, -1.0);
+        pnh_.param("max_brightness", max_brightness_, 256.0);
+        pnh_.param("path_publish_stride", path_publish_stride_, 1);
+        pnh_.param("skip_publish_on_fallback", skip_publish_on_fallback_, false);
         pnh_.param("drop_oldest_when_full", drop_oldest_when_full_, true);
-        pnh_.param("extrapolate_on_failure", params_.ExtrapolateOnFailure, params_.ExtrapolateOnFailure);
-
-        if (!use_camera_info_)
+        std::transform(sync_policy_.begin(), sync_policy_.end(), sync_policy_.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (sync_policy_ != "exact" && sync_policy_ != "approximate")
         {
-            const bool left_looks_color = left_image_topic_.find("camera_color") != std::string::npos;
-            const bool right_looks_color = right_image_topic_.find("camera_color") != std::string::npos;
-            if (left_looks_color || right_looks_color)
-            {
-                ROS_WARN("use_camera_info=false with color image topics; ensure INI/TXT intrinsics are for the same color cameras to avoid drift.");
-            }
+            ROS_WARN("Unknown sync_policy '%s'. Falling back to 'exact'.", sync_policy_.c_str());
+            sync_policy_ = "exact";
+        }
+        process_every_n_ = std::max(1, process_every_n_);
+        target_process_rate_hz_ = std::max(0.0, target_process_rate_hz_);
+        selection_buffer_size_ = std::max(1, selection_buffer_size_);
+        selection_max_latency_sec_ = std::max(0.0, selection_max_latency_sec_);
+        max_brightness_ = std::max(max_brightness_, min_brightness_);
+        path_publish_stride_ = std::max(1, path_publish_stride_);
+        max_stereo_dt_sec_ = std::max(0.0, max_stereo_dt_sec_);
+        if (selector_mode_ != "stride" && selector_mode_ != "quality_buffer")
+        {
+            ROS_WARN("Unknown selector_mode '%s'. Falling back to 'stride'.", selector_mode_.c_str());
+            selector_mode_ = "stride";
         }
 
-        bool loaded_from_ini = false;
-        if (!ini_file_.empty())
+        if (use_camera_info_)
         {
-            try
-            {
-                Utils::GenerateVop2elParamsFromIniFile(ini_file_, params_);
-                loaded_from_ini = true;
-                ROS_INFO("Loaded Vop2el parameters from ini_file: %s", ini_file_.c_str());
-                ROS_INFO("When ini_file is set, VO tuning values are taken from INI/TXT calibration.");
-            }
-            catch (const std::exception& ex)
-            {
-                ROS_FATAL("Failed to load ini_file '%s': %s", ini_file_.c_str(), ex.what());
-                throw;
-            }
-        }
-        if (!loaded_from_ini && !use_camera_info_)
-        {
-            ROS_FATAL("use_camera_info is false but ini_file is empty. Provide ini_file with stereo camera parameters.");
-            throw std::runtime_error("Missing ini_file while use_camera_info=false");
-        }
-        if (!loaded_from_ini)
-        {
-            int of_window_rows = 31;
-            int of_window_cols = 31;
-            int of_pyramid_level = 3;
-            double of_eigen_threshold = 0.001;
-            int of_criteria_max_count = 50;
-            double of_criteria_epsilon = 0.05;
-            double of_forward_backward_threshold = 2.0;
-
-            pnh_.param("optical_flow/window_rows", of_window_rows, of_window_rows);
-            pnh_.param("optical_flow/window_cols", of_window_cols, of_window_cols);
-            pnh_.param("optical_flow/pyramid_level", of_pyramid_level, of_pyramid_level);
-            pnh_.param("optical_flow/eigen_threshold", of_eigen_threshold, of_eigen_threshold);
-            pnh_.param("optical_flow/criteria_max_count", of_criteria_max_count, of_criteria_max_count);
-            pnh_.param("optical_flow/criteria_epsilon", of_criteria_epsilon, of_criteria_epsilon);
-            pnh_.param("optical_flow/forward_backward_threshold", of_forward_backward_threshold, of_forward_backward_threshold);
-
-            params_.OfWindowSize = cv::Size(of_window_cols, of_window_rows);
-            params_.OfPyramidLevel = of_pyramid_level;
-            params_.OfEigenTreshold = of_eigen_threshold;
-            params_.OfForwardBackwardTreshold = static_cast<float>(of_forward_backward_threshold);
-            params_.OfCriteria = cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS,
-                                                  of_criteria_max_count,
-                                                  of_criteria_epsilon);
-
-            int max_num_iterations = 500;
-            bool use_tukey = true;
-            double tukey_parameter = 1.0;
-            pnh_.param("cost_functions/max_num_iterations", max_num_iterations, max_num_iterations);
-            pnh_.param("cost_functions/use_tukey", use_tukey, use_tukey);
-            pnh_.param("cost_functions/tukey_parameter", tukey_parameter, tukey_parameter);
-            params_.CostFunctionsMaxNumIterations = max_num_iterations;
-            params_.UseTukeyEstimator = use_tukey;
-            params_.TukeyParameter = tukey_parameter;
-
-            int max_number_matches = -1;
-            double ncc_threshold = 0.7;
-            int epipolar_line_search_interval = 100;
-            int max_stereo_points_to_process = 10;
-            int half_patch_rows = 4;
-            int half_patch_cols = 4;
-            int half_vertical_search = 4;
-            int half_horizontal_search = 4;
-            double max_thresh = 0.25;
-            pnh_.param("matcher/max_number_matches", max_number_matches, max_number_matches);
-            pnh_.param("matcher/ncc_threshold", ncc_threshold, ncc_threshold);
-            pnh_.param("matcher/epipolar_line_search_interval", epipolar_line_search_interval, epipolar_line_search_interval);
-            pnh_.param("matcher/max_stereo_points_to_process", max_stereo_points_to_process, max_stereo_points_to_process);
-            pnh_.param("matcher/half_patch_rows", half_patch_rows, half_patch_rows);
-            pnh_.param("matcher/half_patch_cols", half_patch_cols, half_patch_cols);
-            pnh_.param("matcher/half_vertical_search", half_vertical_search, half_vertical_search);
-            pnh_.param("matcher/half_horizontal_search", half_horizontal_search, half_horizontal_search);
-            pnh_.param("matcher/max_thresh", max_thresh, max_thresh);
-
-            params_.Vop2elMatcherParams.MaxNumberOfMatches = max_number_matches;
-            params_.Vop2elMatcherParams.NccTreshold = static_cast<float>(ncc_threshold);
-            params_.Vop2elMatcherParams.EpipolarLineSearchInterval = epipolar_line_search_interval;
-            params_.Vop2elMatcherParams.MaxStereoPointsToProcess = max_stereo_points_to_process;
-            params_.Vop2elMatcherParams.HalfPatchRows = half_patch_rows;
-            params_.Vop2elMatcherParams.HalfPatchCols = half_patch_cols;
-            params_.Vop2elMatcherParams.HalfVerticalSearch = half_vertical_search;
-            params_.Vop2elMatcherParams.HalfHorizontalSearch = half_horizontal_search;
-            params_.Vop2elMatcherParams.MaxThresh = static_cast<float>(max_thresh);
-
-            int num_frames_capacity = 2;
-            int bin_width = 50;
-            int bin_height = 50;
-            int max_key_points_per_bin = 3;
-            pnh_.param("stereo_handler/num_frames_capacity", num_frames_capacity, num_frames_capacity);
-            pnh_.param("stereo_handler/bin_width", bin_width, bin_width);
-            pnh_.param("stereo_handler/bin_height", bin_height, bin_height);
-            pnh_.param("stereo_handler/max_key_points_per_bin", max_key_points_per_bin, max_key_points_per_bin);
-
-            params_.StereoImagesHandlerParams.NumFramesCapacity = num_frames_capacity;
-            params_.StereoImagesHandlerParams.BinWidth = bin_width;
-            params_.StereoImagesHandlerParams.BinHeight = bin_height;
-            params_.StereoImagesHandlerParams.MaxNumberOfKeyPointsPerBin = max_key_points_per_bin;
-
-            bool use_ground_plane = false;
-            double plane_normal_x = 0.0;
-            double plane_normal_y = -1.0;
-            double plane_normal_z = 0.0;
-            double plane_distance = 1.65;
-            pnh_.param("ground_plane/use_ground_plane_correction", use_ground_plane, use_ground_plane);
-            pnh_.param("ground_plane/plane_normal_x", plane_normal_x, plane_normal_x);
-            pnh_.param("ground_plane/plane_normal_y", plane_normal_y, plane_normal_y);
-            pnh_.param("ground_plane/plane_normal_z", plane_normal_z, plane_normal_z);
-            pnh_.param("ground_plane/camera_ground_plane_distance", plane_distance, plane_distance);
-
-            params_.PlaneNormal.reset();
-            params_.PlaneDistance.reset();
-            if (use_ground_plane)
-            {
-                params_.PlaneNormal.reset(new cv::Vec3f(static_cast<float>(plane_normal_x),
-                                                        static_cast<float>(plane_normal_y),
-                                                        static_cast<float>(plane_normal_z)));
-                params_.PlaneDistance.reset(new float(static_cast<float>(plane_distance)));
-            }
+            ROS_WARN("INI-only wrapper mode active. Forcing use_camera_info=false.");
+            use_camera_info_ = false;
         }
 
-        pnh_.param("sliding_window/enable", params_.EnableSlidingWindow, params_.EnableSlidingWindow);
-        pnh_.param("sliding_window/size", params_.SlidingWindowSize, params_.SlidingWindowSize);
-        pnh_.param("sliding_window/background", params_.SlidingWindowBackground, params_.SlidingWindowBackground);
+        if (ini_file_.empty())
+        {
+            ROS_FATAL("INI-only wrapper mode requires ini_file. Provide a valid Vop2elParameters file.");
+            throw std::runtime_error("Missing ini_file (INI-only mode)");
+        }
+
+        try
+        {
+            Utils::GenerateVop2elParamsFromIniFile(ini_file_, params_);
+            ROS_INFO("Loaded Vop2el parameters from ini_file: %s", ini_file_.c_str());
+            ROS_INFO("INI-only mode: YAML algorithm parameter blocks are ignored.");
+        }
+        catch (const std::exception& ex)
+        {
+            ROS_FATAL("Failed to load ini_file '%s': %s", ini_file_.c_str(), ex.what());
+            throw;
+        }
+
+        const bool left_looks_color = left_image_topic_.find("camera_color") != std::string::npos;
+        const bool right_looks_color = right_image_topic_.find("camera_color") != std::string::npos;
+        if (left_looks_color || right_looks_color)
+        {
+            ROS_WARN("INI-only mode with color topics: ensure ini_file calibration belongs to the same color cameras.");
+        }
+
+        ROS_INFO("Frame selection: mode=%s, process_every_n=%d, target_process_rate_hz=%.3f, "
+                 "selection_buffer_size=%d, selection_max_latency_sec=%.3f, min_sharpness=%.3f, sync_policy=%s, max_stereo_dt_sec=%.4f, "
+                 "brightness=[%.3f, %.3f], skip_publish_on_fallback=%s",
+                 selector_mode_.c_str(), process_every_n_, target_process_rate_hz_,
+                 selection_buffer_size_, selection_max_latency_sec_, min_sharpness_, sync_policy_.c_str(), max_stereo_dt_sec_,
+                 min_brightness_, max_brightness_, skip_publish_on_fallback_ ? "true" : "false");
     }
 
     bool UpdateCameraParams(const sensor_msgs::CameraInfoConstPtr& left_info,
@@ -461,7 +441,10 @@ private:
         cv_bridge::CvImageConstPtr cv_ptr;
         try
         {
-            cv_ptr = cv_bridge::toCvShare(msg, msg->encoding);
+            if (force_grayscale_)
+                cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::MONO8);
+            else
+                cv_ptr = cv_bridge::toCvShare(msg, msg->encoding);
         }
         catch (const cv_bridge::Exception& ex)
         {
@@ -475,20 +458,76 @@ private:
         return true;
     }
 
-    void EnqueueStereoPair(const sensor_msgs::ImageConstPtr& left_msg,
-                           const sensor_msgs::ImageConstPtr& right_msg)
+    bool ShouldSelectFrame(const ros::Time& stamp, uint64_t received)
     {
+        if (process_every_n_ > 1 && ((received - 1) % static_cast<uint64_t>(process_every_n_)) != 0)
         {
-            std::lock_guard<std::mutex> lock(algorithm_mutex_);
-            if (!camera_ready_ || !algorithm_)
-                return;
+            frames_skipped_selector_.fetch_add(1, std::memory_order_relaxed);
+            return false;
         }
 
-        cv::Mat left_img;
-        cv::Mat right_img;
-        if (!ConvertImageMsg(left_msg, left_img) || !ConvertImageMsg(right_msg, right_img))
-            return;
+        if (target_process_rate_hz_ > 0.0)
+        {
+            const double min_dt = 1.0 / target_process_rate_hz_;
+            std::lock_guard<std::mutex> lock(selector_mutex_);
+            if (!last_selected_stamp_.isZero() && stamp.isValid() && stamp >= last_selected_stamp_)
+            {
+                const double dt = (stamp - last_selected_stamp_).toSec();
+                if (dt < min_dt)
+                {
+                    frames_skipped_selector_.fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
+            }
+            if (stamp.isValid())
+                last_selected_stamp_ = stamp;
+        }
 
+        return true;
+    }
+
+    bool ComputeQualityMetrics(const cv::Mat& image, double& sharpness, double& brightness) const
+    {
+        if (image.empty())
+            return false;
+
+        cv::Mat gray;
+        if (image.channels() == 1)
+            gray = image;
+        else if (image.channels() == 3)
+            cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+        else if (image.channels() == 4)
+            cv::cvtColor(image, gray, cv::COLOR_BGRA2GRAY);
+        else
+            return false;
+
+        cv::Scalar mean_val = cv::mean(gray);
+        brightness = mean_val[0];
+
+        cv::Mat lap;
+        cv::Laplacian(gray, lap, CV_64F);
+        cv::Scalar mu, sigma;
+        cv::meanStdDev(lap, mu, sigma);
+        sharpness = sigma[0] * sigma[0];
+        return true;
+    }
+
+    bool PassQualityGate(const cv::Mat& left_img, double& score, double& brightness)
+    {
+        if (!ComputeQualityMetrics(left_img, score, brightness))
+            return false;
+
+        if (min_sharpness_ > 0.0 && score < min_sharpness_)
+            return false;
+        if (min_brightness_ >= 0.0 && brightness < min_brightness_)
+            return false;
+        if (max_brightness_ <= 255.0 && brightness > max_brightness_)
+            return false;
+        return true;
+    }
+
+    void PushFrameToQueue(BufferedStereoFrame&& frame)
+    {
         std::unique_lock<std::mutex> lock(queue_mutex_);
         while (static_cast<int>(frame_queue_.size()) >= std::max(1, input_buffer_size_))
         {
@@ -503,10 +542,106 @@ private:
             ROS_WARN_THROTTLE(2.0, "Input buffer full; dropping oldest stereo frame.");
         }
 
-        frame_queue_.push_back(BufferedStereoFrame{left_img, right_img, left_msg->header.stamp});
+        frame_queue_.push_back(std::move(frame));
         frames_enqueued_.fetch_add(1, std::memory_order_relaxed);
         lock.unlock();
         queue_cv_.notify_one();
+    }
+
+    bool SelectFromQualityBuffer(const BufferedStereoFrame& frame, double score, BufferedStereoFrame& selected)
+    {
+        std::lock_guard<std::mutex> lock(selector_mutex_);
+        selector_candidates_.push_back(SelectorCandidate{frame, score});
+        if (static_cast<int>(selector_candidates_.size()) > selection_buffer_size_)
+            selector_candidates_.pop_front();
+
+        bool flush_due_to_size = static_cast<int>(selector_candidates_.size()) >= selection_buffer_size_;
+        bool flush_due_to_latency = false;
+        if (!selector_candidates_.empty() && selection_max_latency_sec_ > 0.0 && frame.stamp.isValid() && selector_candidates_.front().frame.stamp.isValid())
+        {
+            const double age = (frame.stamp - selector_candidates_.front().frame.stamp).toSec();
+            flush_due_to_latency = age >= selection_max_latency_sec_;
+        }
+        if (!flush_due_to_size && !flush_due_to_latency)
+            return false;
+
+        auto best_it = std::max_element(selector_candidates_.begin(), selector_candidates_.end(),
+                                        [](const SelectorCandidate& a, const SelectorCandidate& b)
+                                        {
+                                            return a.score < b.score;
+                                        });
+        if (best_it == selector_candidates_.end())
+            return false;
+
+        selected = best_it->frame;
+        selector_candidates_.clear();
+        frames_selected_quality_buffer_.fetch_add(1, std::memory_order_relaxed);
+
+        if (target_process_rate_hz_ > 0.0)
+        {
+            const double min_dt = 1.0 / target_process_rate_hz_;
+            if (!last_selected_stamp_.isZero() && selected.stamp.isValid() && selected.stamp >= last_selected_stamp_)
+            {
+                const double dt = (selected.stamp - last_selected_stamp_).toSec();
+                if (dt < min_dt)
+                {
+                    frames_skipped_selector_.fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
+            }
+        }
+        if (selected.stamp.isValid())
+            last_selected_stamp_ = selected.stamp;
+        return true;
+    }
+
+    void EnqueueStereoPair(const sensor_msgs::ImageConstPtr& left_msg,
+                           const sensor_msgs::ImageConstPtr& right_msg)
+    {
+        if (left_msg->header.stamp.isValid() && right_msg->header.stamp.isValid())
+        {
+            const double dt = std::abs((left_msg->header.stamp - right_msg->header.stamp).toSec());
+            if (dt > max_stereo_dt_sec_)
+            {
+                frames_skipped_desync_.fetch_add(1, std::memory_order_relaxed);
+                ROS_WARN_THROTTLE(2.0, "Skipping desynchronized stereo pair. |dt|=%.6f sec (> %.6f sec)", dt, max_stereo_dt_sec_);
+                return;
+            }
+        }
+
+        const uint64_t received = frames_received_.fetch_add(1, std::memory_order_relaxed) + 1;
+        {
+            std::lock_guard<std::mutex> lock(algorithm_mutex_);
+            if (!camera_ready_ || !algorithm_)
+                return;
+        }
+
+        cv::Mat left_img;
+        cv::Mat right_img;
+        if (!ConvertImageMsg(left_msg, left_img) || !ConvertImageMsg(right_msg, right_img))
+            return;
+        BufferedStereoFrame frame{left_img, right_img, left_msg->header.stamp};
+
+        if (selector_mode_ == "quality_buffer")
+        {
+            double sharpness = 0.0;
+            double brightness = 0.0;
+            if (!PassQualityGate(left_img, sharpness, brightness))
+            {
+                frames_rejected_quality_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+
+            BufferedStereoFrame selected;
+            if (!SelectFromQualityBuffer(frame, sharpness, selected))
+                return;
+            PushFrameToQueue(std::move(selected));
+            return;
+        }
+
+        if (!ShouldSelectFrame(left_msg->header.stamp, received))
+            return;
+        PushFrameToQueue(std::move(frame));
     }
 
     void PublishFeatures(const std::vector<cv::Point2f>& features, const ros::Time& stamp)
@@ -597,20 +732,35 @@ private:
 
         add_key_value("queue_depth", std::to_string(queue_depth));
         add_key_value("input_buffer_size", std::to_string(input_buffer_size_));
+        add_key_value("selector_mode", selector_mode_);
+        add_key_value("process_every_n", std::to_string(process_every_n_));
+        add_key_value("target_process_rate_hz", std::to_string(target_process_rate_hz_));
+        add_key_value("frames_received", std::to_string(frames_received_.load(std::memory_order_relaxed)));
+        add_key_value("frames_skipped_selector", std::to_string(frames_skipped_selector_.load(std::memory_order_relaxed)));
+        add_key_value("frames_skipped_desync", std::to_string(frames_skipped_desync_.load(std::memory_order_relaxed)));
+        add_key_value("frames_rejected_quality", std::to_string(frames_rejected_quality_.load(std::memory_order_relaxed)));
+        add_key_value("frames_selected_quality_buffer", std::to_string(frames_selected_quality_buffer_.load(std::memory_order_relaxed)));
         add_key_value("frames_enqueued", std::to_string(frames_enqueued_.load(std::memory_order_relaxed)));
         add_key_value("frames_processed", std::to_string(frames_processed_.load(std::memory_order_relaxed)));
+        add_key_value("frames_published", std::to_string(frames_published_.load(std::memory_order_relaxed)));
+        add_key_value("frames_skipped_publish_fallback", std::to_string(frames_skipped_publish_fallback_.load(std::memory_order_relaxed)));
         add_key_value("frames_dropped", std::to_string(frames_dropped_.load(std::memory_order_relaxed)));
         add_key_value("processing_fps", std::to_string(processing_fps_));
         add_key_value("feature_count", std::to_string(feature_count));
         add_key_value("match_count", std::to_string(match_count));
         add_key_value("inlier_count", std::to_string(inlier_count));
         add_key_value("fallback_used", fallback_used ? "true" : "false");
+        add_key_value("skip_publish_on_fallback", skip_publish_on_fallback_ ? "true" : "false");
         add_key_value("extrapolated_on_failure", extrapolated_on_failure ? "true" : "false");
         add_key_value("failure_reason", std::to_string(failure_reason));
         add_key_value("extrapolate_on_failure", params_.ExtrapolateOnFailure ? "true" : "false");
         add_key_value("pose_count", std::to_string(pose_count));
         add_key_value("use_camera_info", use_camera_info_ ? "true" : "false");
         add_key_value("use_rectified", use_rectified_ ? "true" : "false");
+        add_key_value("sync_policy", sync_policy_);
+        add_key_value("max_stereo_dt_sec", std::to_string(max_stereo_dt_sec_));
+        add_key_value("force_grayscale", force_grayscale_ ? "true" : "false");
+        add_key_value("path_publish_stride", std::to_string(path_publish_stride_));
 
         diag.status.push_back(status);
         debug_pub_.publish(diag);
@@ -620,9 +770,10 @@ private:
                            const cv::Mat& right_image,
                            const ros::Time& stamp)
     {
-        std::vector<Eigen::Affine3d> poses;
+        Eigen::Affine3d abs_pose = Eigen::Affine3d::Identity();
         std::vector<cv::Point2f> features;
         Vop2el::Vop2elAlgorithm::FrameDebugStats frame_stats;
+        const bool need_features = publish_features_ || publish_features_image_ || publish_debug_;
         {
             std::lock_guard<std::mutex> lock(algorithm_mutex_);
             if (!camera_ready_ || !algorithm_)
@@ -630,13 +781,11 @@ private:
 
             Eigen::Affine3d relative = Eigen::Affine3d::Identity();
             algorithm_->ProcessStereoFrame(left_image, right_image, relative);
-            poses = algorithm_->GetPosesCopy();
-            features = algorithm_->GetLatestLeftKeyPointsCopy();
+            abs_pose = algorithm_->GetCurrentAbsPoseCopy();
+            if (need_features)
+                features = algorithm_->GetLatestLeftKeyPointsCopy();
             frame_stats = algorithm_->GetLastFrameDebugStats();
         }
-
-        if (poses.empty())
-            return;
 
         frames_processed_.fetch_add(1, std::memory_order_relaxed);
         ros::WallTime now_wall = ros::WallTime::now();
@@ -652,8 +801,17 @@ private:
         last_process_wall_ = now_wall;
         has_last_process_wall_ = true;
 
-        Eigen::Affine3d abs_pose = poses.back();
+        if (skip_publish_on_fallback_ && frame_stats.UsedFallback)
+        {
+            frames_skipped_publish_fallback_.fetch_add(1, std::memory_order_relaxed);
+            PublishDebug(stamp, features.size(), published_poses_.size(),
+                         frame_stats.MatchCount, frame_stats.InlierCount,
+                         frame_stats.UsedFallback, frame_stats.UsedExtrapolation, frame_stats.FailureReason);
+            return;
+        }
+
         published_poses_.push_back(abs_pose);
+        frames_published_.fetch_add(1, std::memory_order_relaxed);
 
         if (publish_odom_)
         {
@@ -667,19 +825,17 @@ private:
 
         if (publish_path_)
         {
-            nav_msgs::Path path;
-            path.header.stamp = stamp;
-            path.header.frame_id = odom_frame_;
-            path.poses.reserve(published_poses_.size());
-            for (const auto& pose : published_poses_)
-            {
-                geometry_msgs::PoseStamped ps;
-                ps.header.stamp = stamp;
-                ps.header.frame_id = odom_frame_;
-                ps.pose = PoseFromEigen(pose);
-                path.poses.push_back(ps);
-            }
-            path_pub_.publish(path);
+            geometry_msgs::PoseStamped ps;
+            ps.header.stamp = stamp;
+            ps.header.frame_id = odom_frame_;
+            ps.pose = PoseFromEigen(abs_pose);
+            path_msg_.header.stamp = stamp;
+            path_msg_.header.frame_id = odom_frame_;
+            path_msg_.poses.push_back(ps);
+
+            ++path_publish_counter_;
+            if (path_msg_.poses.size() == 1 || (path_publish_counter_ % static_cast<uint64_t>(path_publish_stride_)) == 0)
+                path_pub_.publish(path_msg_);
         }
 
         if (publish_tf_)

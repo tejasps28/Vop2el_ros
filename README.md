@@ -98,18 +98,37 @@ If you need GUI tools (rviz/rqt), run `xhost +local:root` on the host before sta
 
 ## ROS1 Wrapper (Realtime Buffer)
 
-The ROS1 wrapper can run in two modes:
+The wrapper is configured as **INI-only** for algorithm parameters to keep core VO behavior identical to upstream Vop2el.
+YAML is used only for ROS topics, publishing, buffering, and frame-selection policy.
 
-- `use_camera_info: true`: intrinsics/extrinsics come from ROS `CameraInfo` (+ TF when `use_rectified: false`).
-- `use_camera_info: false`: use original Vop2el INI/TXT calibration only (image topics only).
-
-For an original-style setup (INI/TXT + realtime image stream), set in `vop2el_ros1/config/vop2el.yaml`:
+For realtime ROS setup, configure in `vop2el_ros1/config/vop2el.yaml`:
 
 - `ini_file: /volp2el_ws/src/Vop2el_ros/my_files/Vop2elParameters.txt`
 - `use_camera_info: false`
-- `input_buffer_size: 5`
+- `queue_size: 50`
+- `input_buffer_size: 60`
 - `drop_oldest_when_full: true`
-- `extrapolate_on_failure: false` (recommended; holds pose on tracking failure instead of repeating last motion)
+- `sync_policy: exact` (recommended for rosbag/KITTI-style playback)
+- `max_stereo_dt_sec: 0.002` (skip badly paired stereo frames)
+- `force_grayscale: true` (convert input to MONO8 before VO)
+- `selector_mode: stride` (`stride` or `quality_buffer`)
+- `process_every_n: 1` (for `stride` mode)
+- `target_process_rate_hz: 0.0` (optional cap; 0 disables)
+- `selection_buffer_size: 3` (for `quality_buffer` mode)
+- `selection_max_latency_sec: 0.15` (for `quality_buffer` mode)
+- `min_sharpness: 0.0`, `min_brightness: -1.0`, `max_brightness: 256.0` (quality gates)
+- `skip_publish_on_fallback: false` (if true, fallback frames are not published)
+- `path_publish_stride: 5` (reduce path publishing overhead while keeping odom every frame)
+
+For best tracking fidelity (closest to folder-mode behavior), keep heavy debug publishers off during VO runs:
+
+- `publish_debug: false`
+- `publish_features: false`
+- `publish_features_image: false`
+
+Optional for tighter realtime behavior under recording/load:
+
+- Set `VOP2EL_NUM_THREADS=4` (or lower) before launch to cap Ceres solver threads and avoid CPU oversubscription.
 
 Build and run inside the container:
 
@@ -118,6 +137,7 @@ source /opt/ros/noetic/setup.bash
 cd /volp2el_ws
 catkin_make -DCMAKE_BUILD_TYPE=Release
 source devel/setup.bash
+export VOP2EL_NUM_THREADS=4
 roslaunch vop2el_ros1 vop2el.launch
 ```
 
@@ -129,8 +149,36 @@ Published outputs:
 - Feature overlay image: `/vo/features_image` (`sensor_msgs/Image`, green dots over left image)
 - Debug stats: `/vo/debug` (`diagnostic_msgs/DiagnosticArray`), including:
 - `match_count`, `inlier_count`, `fallback_used`, `extrapolated_on_failure`, `failure_reason`
+- Selector/pipeline counters: `frames_received`, `frames_skipped_selector`, `frames_skipped_desync`, `frames_rejected_quality`, `frames_selected_quality_buffer`, `frames_enqueued`, `frames_processed`, `frames_published`, `frames_skipped_publish_fallback`, `frames_dropped`
 
-Example rosbag playback (`use_camera_info: false`):
+Record full-trajectory debug stats with debug publishing forced from launch:
+
+```bash
+rosrun vop2el_ros1 record_debug_stats.sh \
+  /volp2el_ws/src/Vop2el_ros/vop2el_ros1/config/vop2el.yaml \
+  /volp2el_ws/src/debug_bags
+```
+
+This runs `vop2el_record_debug.launch`, sets `publish_debug=true`, and records:
+- `/vo/debug`
+- `/vo/odom`
+- `/vo/path`
+- `/vo/features`
+
+To record TUM format from odometry, run the separate recorder node:
+
+```bash
+rosrun vop2el_ros1 odom_to_tum.py _odom_topic:=/vo/odom _tum_output_file:=/volp2el_ws/src/vo_tum.txt
+```
+
+Parameters for `odom_to_tum.py`:
+
+- `_odom_topic` (default: `/vo/odom`)
+- `_tum_output_file` (default: `vo_tum.txt`)
+- `_append` (default: `false`)
+- `_flush_interval` (default: `100`)
+
+Example rosbag playback:
 
 ```bash
 rosbag play /datasets/<your_bag>.bag --clock \

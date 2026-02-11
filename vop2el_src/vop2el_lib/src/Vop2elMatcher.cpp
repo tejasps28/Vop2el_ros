@@ -775,6 +775,6 @@ void Vop2elMatcher::GetMatches(std::vector<Vop2el::Match>& matches)
     for (auto correspondency : matchesAndIdx)
         matches.push_back(correspondency.first);
 
-    std::cout << "Number of corrected key points using patch corrector is: " << numCorrected << std::endl;
+    (void)numCorrected;
 }
 }

@@ -26,69 +26,43 @@ base_frame: camera_left
 publish_tf: true
 publish_odom: true
 publish_path: true
-publish_features: true
-publish_features_image: true
-publish_debug: true
+publish_features: false
+publish_features_image: false
+publish_debug: false
 
-# Sync and extrinsics
+# Sync / buffering / frame selection
 queue_size: 10
 # Active stereo frame buffer (push/pop queue used by wrapper before VO processing)
 input_buffer_size: 5
-drop_oldest_when_full: false #true
-# On VO failure (low matches/OpenCV exception):
-# false = hold pose (prevents runaway drift cascade)
-extrapolate_on_failure: false
-# If true, extrinsics are derived from right CameraInfo P matrix (rectified stereo).
-# If false, extrinsics are fetched from TF between left/right camera frames.
+drop_oldest_when_full: true
+# Stereo synchronization policy:
+# - exact: strict timestamp pairing (recommended for offline rosbag / KITTI-like data)
+# - approximate: relaxed pairing
+sync_policy: approximate
+# Additional protection: skip stereo pairs with |left_stamp-right_stamp| larger than this.
+max_stereo_dt_sec: 0.002
+# Convert incoming images to MONO8 before VO for consistency and speed.
+force_grayscale: true
+# selector_mode:
+# - stride: fixed decimation with process_every_n
+# - quality_buffer: keep a short buffer of good frames and select the sharpest
+selector_mode: stride
+# stride mode: process only every Nth synchronized stereo pair (1 = every frame)
+process_every_n: 1 #2
+# optional upper bound on selected processing rate in Hz (0.0 disables)
+target_process_rate_hz: 0.0
+# quality_buffer mode parameters
+selection_buffer_size: 3
+selection_max_latency_sec: 0.15
+min_sharpness: 0.0
+min_brightness: -1.0
+max_brightness: 256.0
+# if true, do not publish odom/path/tf/features for fallback frames
+skip_publish_on_fallback: false
+# Publish full /vo/path every N processed frames to reduce runtime overhead.
+path_publish_stride: 10
+
+# Camera-info / TF path is disabled in INI-only mode, but these are kept for compatibility.
 use_rectified: true
-# TF lookup timeout in seconds (only used when use_rectified is false).
+# TF lookup timeout in seconds (relevant only if camera-info mode is enabled in future).
 tf_lookup_timeout: 0.1
-
-# Sliding window optimization (pose-only)
-sliding_window:
-  enable: true
-  size: 8
-  background: true
-
-# Optical flow parameters (used when ini_file is empty)
-optical_flow:
-  window_rows: 31
-  window_cols: 31
-  pyramid_level: 3
-  eigen_threshold: 0.001
-  criteria_max_count: 50
-  criteria_epsilon: 0.05
-  forward_backward_threshold: 1.5
-
-# Non-linear cost functions parameters
-cost_functions:
-  max_num_iterations: 500
-  use_tukey: true
-  tukey_parameter: 1.0
-
-# Matcher parameters (used when ini_file is empty)
-matcher:
-  max_number_matches: -1
-  ncc_threshold: 0.75
-  epipolar_line_search_interval: 100
-  max_stereo_points_to_process: 10
-  half_patch_rows: 4
-  half_patch_cols: 4
-  half_vertical_search: 4
-  half_horizontal_search: 4
-  max_thresh: 0.25
-
-# Stereo images handler parameters
-stereo_handler:
-  num_frames_capacity: 2
-  bin_width: 50
-  bin_height: 50
-  max_key_points_per_bin: 7 #3
-
-# Ground plane correction parameters
-ground_plane:
-  use_ground_plane_correction: false
-  plane_normal_x: 0.0
-  plane_normal_y: -1.0
-  plane_normal_z: 0.0
-  camera_ground_plane_distance: 1.65
