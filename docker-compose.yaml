@@ -1,0 +1,22 @@
+services:
+  ros2-dev:
+    image: osrf/ros:${ROS_DISTRO:-humble}-desktop
+    container_name: vop2el_ros2_dev
+    working_dir: /vop2el_ws
+    stdin_open: true
+    tty: true
+    init: true
+    network_mode: host
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-0}
+    volumes:
+      - ../../:/vop2el_ws:rw
+      - /home/tejas/project_workspaces/datasets:/datasets:rw
+    command: >
+      bash -lc "
+      source /opt/ros/${ROS_DISTRO:-humble}/setup.bash &&
+      echo 'ROS2 dev container ready at /vop2el_ws' &&
+      sleep infinity
+      "

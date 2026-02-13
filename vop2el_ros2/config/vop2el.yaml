@@ -1,0 +1,70 @@
+vop2el:
+  ros__parameters:
+    # Topics (override these with your dataset-specific values)
+    left_image_topic: /kitti/camera_gray_left/image_raw
+    right_image_topic: /kitti/camera_gray_right/image_raw
+    left_camera_info_topic: /kitti/camera_gray_left/camera_info
+    right_camera_info_topic: /kitti/camera_gray_right/camera_info
+
+    # Optional path to the original Vop2el INI file.
+    # Launch file overrides this with the packaged default INI path if left empty.
+    ini_file: ""
+
+    # INI-only mode in this wrapper (camera info path is intentionally disabled)
+    use_camera_info: false
+
+    # Frame overrides (optional). If empty, use frame_id from CameraInfo.
+    left_frame_override: ""
+    right_frame_override: ""
+
+    # Output
+    odom_topic: /vo/odom
+    path_topic: /vo/path
+    features_topic: /vo/features
+    features_image_topic: /vo/features_image
+    debug_topic: /vo/debug
+    odom_frame: odom
+    base_frame: camera_left
+    publish_tf: true
+    publish_odom: true
+    publish_path: true
+    publish_features: false
+    publish_features_image: false
+    publish_debug: false
+
+    # Sync / buffering / frame selection
+    queue_size: 10
+    input_buffer_size: 5
+    drop_oldest_when_full: true
+
+    # Stereo sync policy: exact | approximate
+    sync_policy: approximate
+    # If > 0, reject stereo pairs above this dt. Set to 0.0 to disable this check.
+    max_stereo_dt_sec: 0.002
+    force_grayscale: true
+
+    # selector_mode: stride | quality_buffer
+    selector_mode: stride
+    process_every_n: 1
+    target_process_rate_hz: 0.0
+
+    # quality_buffer mode parameters
+    selection_buffer_size: 3
+    selection_max_latency_sec: 0.15
+    min_sharpness: 0.0
+    min_brightness: -1.0
+    max_brightness: 256.0
+
+    skip_publish_on_fallback: false
+    path_publish_stride: 10
+
+    # OpenCV runtime tuning:
+    # - use_opencl=true enables experimental OpenCL path for LK + matchTemplate.
+    # - opencv_num_threads=0 keeps OpenCV default thread policy.
+    #   Set to 1 when OpenMP matcher is active to avoid CPU oversubscription.
+    use_opencl: false
+    opencv_num_threads: 0
+
+    # Kept for compatibility with prior ROS1 config
+    use_rectified: true
+    tf_lookup_timeout: 0.1

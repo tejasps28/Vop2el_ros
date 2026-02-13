@@ -22,6 +22,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cstdlib>
+#include <opencv2/core/ocl.hpp>
 
 #include "Vop2elAlgorithm.h"
 #include "Common.h"
@@ -49,6 +50,11 @@ int GetSolverNumThreads()
         return static_cast<int>(std::min<unsigned int>(hw, 4u));
     }();
     return configured_threads;
+}
+
+bool ShouldUseOpenCL()
+{
+    return cv::ocl::useOpenCL();
 }
 
 void LogFallbackWarning(bool extrapolate_on_failure)
@@ -115,16 +121,42 @@ void Vop2elAlgorithm::EstimateInitMatchesUsingOF(std::shared_ptr<const cv::Mat> 
     std::vector<uchar> statusForward;
     std::vector<float> errorsForward;
     std::vector<cv::Point2f> actualKeyPoints;
-    cv::calcOpticalFlowPyrLK(*refImage, *tarImage, *refImageKeyPoints, actualKeyPoints, statusForward, errorsForward,
-                            this->Vop2elParams.OfWindowSize, this->Vop2elParams.OfPyramidLevel, this->Vop2elParams.OfCriteria,
-                            0, this->Vop2elParams.OfEigenTreshold);
+    if (ShouldUseOpenCL())
+    {
+        cv::UMat refImageUmat;
+        cv::UMat tarImageUmat;
+        refImage->copyTo(refImageUmat);
+        tarImage->copyTo(tarImageUmat);
+        cv::calcOpticalFlowPyrLK(refImageUmat, tarImageUmat, *refImageKeyPoints, actualKeyPoints, statusForward, errorsForward,
+                                 this->Vop2elParams.OfWindowSize, this->Vop2elParams.OfPyramidLevel, this->Vop2elParams.OfCriteria,
+                                 0, this->Vop2elParams.OfEigenTreshold);
+    }
+    else
+    {
+        cv::calcOpticalFlowPyrLK(*refImage, *tarImage, *refImageKeyPoints, actualKeyPoints, statusForward, errorsForward,
+                                 this->Vop2elParams.OfWindowSize, this->Vop2elParams.OfPyramidLevel, this->Vop2elParams.OfCriteria,
+                                 0, this->Vop2elParams.OfEigenTreshold);
+    }
 
     std::vector<uchar> statusBackward;
     std::vector<float> errorsBackward;
     std::vector<cv::Point2f> refKeyPointsBack;
-    cv::calcOpticalFlowPyrLK(*tarImage, *refImage, actualKeyPoints, refKeyPointsBack, statusBackward, errorsBackward,
-                            this->Vop2elParams.OfWindowSize, this->Vop2elParams.OfPyramidLevel, this->Vop2elParams.OfCriteria,
-                            0, this->Vop2elParams.OfEigenTreshold);
+    if (ShouldUseOpenCL())
+    {
+        cv::UMat tarImageUmat;
+        cv::UMat refImageUmat;
+        tarImage->copyTo(tarImageUmat);
+        refImage->copyTo(refImageUmat);
+        cv::calcOpticalFlowPyrLK(tarImageUmat, refImageUmat, actualKeyPoints, refKeyPointsBack, statusBackward, errorsBackward,
+                                 this->Vop2elParams.OfWindowSize, this->Vop2elParams.OfPyramidLevel, this->Vop2elParams.OfCriteria,
+                                 0, this->Vop2elParams.OfEigenTreshold);
+    }
+    else
+    {
+        cv::calcOpticalFlowPyrLK(*tarImage, *refImage, actualKeyPoints, refKeyPointsBack, statusBackward, errorsBackward,
+                                 this->Vop2elParams.OfWindowSize, this->Vop2elParams.OfPyramidLevel, this->Vop2elParams.OfCriteria,
+                                 0, this->Vop2elParams.OfEigenTreshold);
+    }
 
     for (int keyPointIdx = 0; keyPointIdx < refImageKeyPoints->size(); ++keyPointIdx)
     {

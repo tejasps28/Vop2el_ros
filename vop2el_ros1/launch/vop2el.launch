@@ -1,9 +1,0 @@
-<launch>
-  <arg name="config" default="$(find vop2el_ros1)/config/vop2el.yaml"/>
-  <arg name="publish_debug" default="false"/>
-
-  <node pkg="vop2el_ros1" type="vop2el_node" name="vop2el" output="screen">
-    <rosparam command="load" file="$(arg config)"/>
-    <param name="publish_debug" value="$(arg publish_debug)"/>
-  </node>
-</launch>

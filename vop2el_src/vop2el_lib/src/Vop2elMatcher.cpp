@@ -21,6 +21,7 @@
 #include "Vop2elMatcher.h"
 #include <atomic>
 #include <limits>
+#include <opencv2/core/ocl.hpp>
 
 namespace Vop2el
 {
@@ -65,6 +66,23 @@ void LogTemplateMatchFailure(const char* where,
               << " type=" << second.type() << " step=" << second.step << std::endl;
     if (current == kMaxLogs - 1)
         std::cerr << "[ERROR] Suppressing further matchTemplate logs." << std::endl;
+}
+
+void RunTemplateMatch(const cv::Mat& search, const cv::Mat& reference, cv::Mat& output)
+{
+    if (cv::ocl::useOpenCL())
+    {
+        cv::UMat searchUmat;
+        cv::UMat referenceUmat;
+        cv::UMat outputUmat;
+        search.copyTo(searchUmat);
+        reference.copyTo(referenceUmat);
+        cv::matchTemplate(searchUmat, referenceUmat, outputUmat, cv::TM_CCOEFF_NORMED);
+        outputUmat.copyTo(output);
+        return;
+    }
+
+    cv::matchTemplate(search, reference, output, cv::TM_CCOEFF_NORMED);
 }
 }
 struct Vop2elMatcher::PatchWithScore
@@ -302,7 +320,7 @@ void Vop2elMatcher::ComputeNccOnEpipolarLine(const cv::Mat& referencePatch,
         cv::Mat nVCCScore;
         try
         {
-            cv::matchTemplate(searchMat, refMat, nVCCScore, cv::TM_CCOEFF_NORMED);
+            RunTemplateMatch(searchMat, refMat, nVCCScore);
         }
         catch (const cv::Exception& ex)
         {
@@ -440,7 +458,7 @@ void Vop2elMatcher::SearchMatchesPreviousFrame(const cv::Mat& referencePatch,
     }
     try
     {
-        cv::matchTemplate(candidateRegion, refMat, nVCCScores, cv::TM_CCOEFF_NORMED);
+        RunTemplateMatch(candidateRegion, refMat, nVCCScores);
     }
     catch (const cv::Exception& ex)
     {

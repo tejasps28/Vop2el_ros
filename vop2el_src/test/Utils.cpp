@@ -19,6 +19,7 @@
  */
 
 #include "Utils.h"
+#include <filesystem>
 
 //---------------------------------------------------------------------------------------
 void Utils::GetCameraParamsFromTxtFile(const std::string& stereoCameraPath,
@@ -82,7 +83,25 @@ void Utils::GenerateVop2elParamsFromIniFile(const std::string& iniFile,
         throw std::runtime_error("[ERROR] Could not read ini parameters file: " + iniFile);
 
     std::string stereoCameraPath = ini["stereo_camera_parameters"]["stereo_camera_parameters"];
-    Utils::GetCameraParamsFromTxtFile(stereoCameraPath, vop2elParameters.CameraParams.CalibrationMatrix,
+
+    namespace fs = std::filesystem;
+    fs::path stereoCameraPathResolved(stereoCameraPath);
+    const fs::path iniDir = fs::absolute(fs::path(iniFile)).parent_path();
+    if (stereoCameraPathResolved.is_relative())
+    {
+        const fs::path candidate = iniDir / stereoCameraPathResolved;
+        if (fs::exists(candidate))
+            stereoCameraPathResolved = candidate;
+    }
+    else if (!fs::exists(stereoCameraPathResolved))
+    {
+        // Backward-compatibility fallback for stale absolute paths in copied config files.
+        const fs::path candidate = iniDir / stereoCameraPathResolved.filename();
+        if (fs::exists(candidate))
+            stereoCameraPathResolved = candidate;
+    }
+
+    Utils::GetCameraParamsFromTxtFile(stereoCameraPathResolved.string(), vop2elParameters.CameraParams.CalibrationMatrix,
                                     vop2elParameters.CameraParams.ExtrinsicRotation, vop2elParameters.CameraParams.ExtrinsicTranslation);
 
     vop2elParameters.CameraParams.cols = std::stoi(ini["stereo_camera_parameters"]["image_cols"]);
